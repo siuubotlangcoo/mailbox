@@ -24,6 +24,9 @@ local Cfg = {
 	DEFAULT_SEND_DELAY = 0.0,
 	MIN_SEND_DELAY = 0.0,
 	MAX_COOLDOWN_RETRIES = 25,
+	MAX_TRANSIENT_RETRIES = 3,
+	AUTO_RETRY_PASSES = 3,
+	RETRY_WAVE_DELAY = 2.0,
 	MAX_RESULTS = 45,
 	MAILBOX_MAX_DIST = 18,
 	REQUIRE_TIMEOUT = 1.2,
@@ -1808,6 +1811,15 @@ function F.stopSendingNow(reasonText)
 	end
 end
 
+function F.isPermanentSendError(errStr)
+	local le = string.lower(tostring(errStr or ""))
+	if string.find(le, "yourself") or string.find(le, "own account") or string.find(le, "same player") then return true end
+	if string.find(le, "doesn't exist") or string.find(le, "does not exist") or string.find(le, "invalid user") or string.find(le, "invalid player") then return true end
+	if (string.find(le, "player") or string.find(le, "user")) and string.find(le, "not found") then return true end
+	if string.find(le, "disabled") or string.find(le, "not accepting") or string.find(le, "friends only") or string.find(le, "only friends") or string.find(le, "huges only") or string.find(le, "only huges") or string.find(le, "minimum") or string.find(le, "mailbox is full") or string.find(le, "inbox is full") then return true end
+	return false
+end
+
 function F.startSending()
 	if S.isSending then F.stopSendingNow("Stopped sending.") return end
 	if S.isScanning then F.setStatus("Wait for scan to finish (~1s) before sending.", Color3.fromRGB(245, 185, 95)) return end
@@ -1852,131 +1864,187 @@ function F.startSending()
 
 	S.sendThread = task.spawn(function()
 		local totalRecipients, totalSent, totalMails, totalFailed, usersCompleted = #recipients, 0, 0, 0, 0
-		local failedUserNotes, stopReason, lastErrText, maxRemainingByUid = {}, nil, "", {}
+		local failedUserNotes, stopReason, maxRemainingByUid = {}, nil, {}
 		local batchStartClock, lastSuccessClock, cleanStreak, cachedSendCost = os.clock(), 0, 0, F.getMailboxSendCost()
+		local waveUsed = 0
 
 		local okRun, runErr = pcall(function()
 			local batchStacks, batchOk = F.collectBatchCandidateUids(targetPet.lowerId, targetMut)
 			if not batchOk then stopReason = "Lost Save Data connection." return end
 
-			for rIdx = 1, totalRecipients do
-				local recipient = recipients[rIdx]
-				if S.cancelRequested or S.isDestroyed then stopReason = "Stopped." break end
+			local waveQueue = {}
+			for _, name in ipairs(recipients) do
+				table.insert(waveQueue, { user = name, remaining = qtyPerUser, reason = "", perm = false })
+			end
+			local failedMap, wave = {}, 0
 
-				local sentForThisUser, remainingQty, skipRecipient, recipientFailReason, staleRetries = 0, qtyPerUser, false, nil, 0
-				while remainingQty > 0 do
-					if S.cancelRequested or S.isDestroyed or skipRecipient then break end
-					if lastSuccessClock > 0 and adaptiveDelay > 0 then
-						local waitLeft = (lastSuccessClock + adaptiveDelay) - os.clock()
-						if waitLeft > 0.015 then
-							local remAcc = totalRecipients - (usersCompleted + totalFailed)
-							local pfx = waitLeft >= 0.8 and string.format("[%d/%d | %d left] Wait %.1fs -> %s", rIdx, totalRecipients, remAcc, adaptiveDelay, recipient) or nil
-							if not F.waitInterruptible(waitLeft, pfx) then stopReason = "Stopped." break end
-						end
-					end
+			while #waveQueue > 0 do
+				waveUsed = wave
+				local waveTotal = #waveQueue
+				local waveTag = (wave > 0) and string.format("[Retry %d/%d] ", wave, Cfg.AUTO_RETRY_PASSES) or ""
 
-					local cand, saveOk = F.pickFastBatchStack(batchStacks, targetPet.lowerId, targetMut, remainingQty, maxRemainingByUid)
-					if not saveOk then stopReason = "Lost Save Data connection."; S.cancelRequested = true; break end
-					if not cand then stopReason = string.format("Out of [%s] %s.", targetMutLabel, targetPet.displayName); S.cancelRequested = true; break end
+				for rIdx = 1, waveTotal do
+					local taskItem = waveQueue[rIdx]
+					local recipient = taskItem.user
+					if S.cancelRequested or S.isDestroyed then stopReason = "Stopped." break end
 
-					local sendAmt = targetPet.isHugeOrTitanic and 1 or math.min(remainingQty, cand.avail)
-					if totalMails % 10 == 0 then cachedSendCost = F.getMailboxSendCost() end
-					local diamonds = F.getDiamonds()
-					if diamonds > 0 and diamonds < cachedSendCost then
-						stopReason = string.format("Not enough Diamonds! Need %s, have %s.", F.formatCompact(cachedSendCost), F.formatCompact(diamonds))
-						S.cancelRequested = true; break
-					end
-
-					local remAccBefore = totalRecipients - (usersCompleted + totalFailed)
-					local etaText = ""
-					if usersCompleted > 0 then
-						local avgSec = (os.clock() - batchStartClock) / usersCompleted
-						etaText = string.format(" | %.1f acc/m • ~%s", avgSec > 0 and (60 / avgSec) or 0, F.formatEta(avgSec * remAccBefore))
-					end
-					F.setStatus(string.format("[%d/%d | %d left] Sending %dx %s -> %s%s", rIdx, totalRecipients, remAccBefore, sendAmt, targetPet.displayName, recipient, etaText), Color3.fromRGB(130, 200, 255))
-
-					local sentOk, retryFreshStack, attemptErr, hitCooldown, successFireClock = false, false, "", false, 0
-					for attempt = 1, Cfg.MAX_COOLDOWN_RETRIES do
-						local fireClock = os.clock()
-						local okCall, errMsg, methodName = F.invokeMailboxSend(recipient, Cfg.MAIL_MESSAGE, cand.uid, sendAmt)
-						if okCall then sentOk, successFireClock = true, fireClock; break end
-						if S.cancelRequested or S.isDestroyed then stopReason = "Stopped." break end
-
-						local errStr = tostring(errMsg or "Server rejected")
-						attemptErr, lastErrText = errStr, string.format("[%s] %s", tostring(methodName or ""), errStr)
-						local le = string.lower(errStr)
-						if string.find(le, "diamond") or string.find(le, "gem") or string.find(le, "afford") or string.find(le, "cost") then
-							stopReason = "Not enough Diamonds: " .. errStr; S.cancelRequested = true; break
-						elseif string.find(le, "cooldown") or string.find(le, "fast") or string.find(le, "wait") or string.find(le, "busy") or string.find(le, "slow") or string.find(le, "again") or string.find(le, "second") or string.find(le, "minute") or string.find(le, "limit") then
-							hitCooldown, cleanStreak = true, 0
-							if attempt < Cfg.MAX_COOLDOWN_RETRIES then
-								local waitSec, hasExact = F.parseCooldownSeconds(errStr, attempt)
-								if hasExact and lastSuccessClock > 0 then
-									local totalCd = (os.clock() - lastSuccessClock) + waitSec
-									if totalCd >= userMinDelay and totalCd <= 65 then adaptiveDelay = math.ceil(totalCd * 10) / 10 end
-								end
-								local cdPfx = waitSec >= 1.0 and string.format("[%d/%d | %d left] Cooldown -> %s", rIdx, totalRecipients, remAccBefore, recipient) or nil
-								if not F.waitInterruptible(waitSec, cdPfx) then stopReason = "Stopped." break end
-							else
-								skipRecipient, recipientFailReason = true, "Cooldown retries exhausted: " .. errStr; break
+					local skipRecipient, recipientFailReason, recipientPerm, staleRetries = false, nil, false, 0
+					while taskItem.remaining > 0 do
+						if S.cancelRequested or S.isDestroyed or skipRecipient then break end
+						local remAccBefore = waveTotal - (rIdx - 1)
+						if lastSuccessClock > 0 and adaptiveDelay > 0 then
+							local waitLeft = (lastSuccessClock + adaptiveDelay) - os.clock()
+							if waitLeft > 0.015 then
+								local pfx = waitLeft >= 0.8 and string.format("%s[%d/%d | %d left] Wait %.1fs -> %s", waveTag, rIdx, waveTotal, remAccBefore, adaptiveDelay, recipient) or nil
+								if not F.waitInterruptible(waitLeft, pfx) then stopReason = "Stopped." break end
 							end
-						elseif string.find(le, "item") and (string.find(le, "found") or string.find(le, "exist") or string.find(le, "missing") or string.find(le, "enough")) then
-							maxRemainingByUid[cand.uid] = 0; staleRetries = staleRetries + 1
-							if staleRetries <= 2 then retryFreshStack = true else skipRecipient, recipientFailReason = true, errStr end
-							break
-						else
-							skipRecipient, recipientFailReason = true, errStr; break
 						end
-					end
 
-					if S.cancelRequested or S.isDestroyed or skipRecipient then break end
-					if sentOk then
-						if lastSuccessClock > 0 then
-							if hitCooldown then
-								local gap = successFireClock - lastSuccessClock
-								if gap >= userMinDelay and gap <= 65 then adaptiveDelay = math.max(adaptiveDelay, math.ceil((gap + 0.05) * 10) / 10) end
+						local cand, saveOk = F.pickFastBatchStack(batchStacks, targetPet.lowerId, targetMut, taskItem.remaining, maxRemainingByUid)
+						if not saveOk then stopReason = "Lost Save Data connection."; S.cancelRequested = true; break end
+						if not cand then stopReason = string.format("Out of [%s] %s.", targetMutLabel, targetPet.displayName); S.cancelRequested = true; break end
+
+						local sendAmt = targetPet.isHugeOrTitanic and 1 or math.min(taskItem.remaining, cand.avail)
+						if totalMails % 10 == 0 then cachedSendCost = F.getMailboxSendCost() end
+						local diamonds = F.getDiamonds()
+						if diamonds > 0 and diamonds < cachedSendCost then
+							stopReason = string.format("Not enough Diamonds! Need %s, have %s.", F.formatCompact(cachedSendCost), F.formatCompact(diamonds))
+							S.cancelRequested = true; break
+						end
+
+						local etaText = ""
+						if usersCompleted > 0 and wave == 0 then
+							local avgSec = (os.clock() - batchStartClock) / usersCompleted
+							etaText = string.format(" | %.1f acc/m • ~%s", avgSec > 0 and (60 / avgSec) or 0, F.formatEta(avgSec * remAccBefore))
+						end
+						F.setStatus(string.format("%s[%d/%d | %d left] Sending %dx %s -> %s%s", waveTag, rIdx, waveTotal, remAccBefore, sendAmt, targetPet.displayName, recipient, etaText), Color3.fromRGB(130, 200, 255))
+
+						local sentOk, retryFreshStack, attemptErr, hitCooldown, successFireClock = false, false, "", false, 0
+						local cooldownHits, transientRetries = 0, 0
+						local maxAttempts = Cfg.MAX_COOLDOWN_RETRIES + Cfg.MAX_TRANSIENT_RETRIES + 2
+						for _ = 1, maxAttempts do
+							local fireClock = os.clock()
+							local okCall, errMsg = F.invokeMailboxSend(recipient, Cfg.MAIL_MESSAGE, cand.uid, sendAmt)
+							if okCall then sentOk, successFireClock = true, fireClock; break end
+							if S.cancelRequested or S.isDestroyed then stopReason = "Stopped." break end
+
+							local errStr = tostring(errMsg or "Server rejected")
+							attemptErr = errStr
+							local le = string.lower(errStr)
+							if string.find(le, "diamond") or string.find(le, "gem") or string.find(le, "afford") or string.find(le, "cost") then
+								stopReason = "Not enough Diamonds: " .. errStr; S.cancelRequested = true; break
+							elseif string.find(le, "cooldown") or string.find(le, "fast") or string.find(le, "wait") or string.find(le, "busy") or string.find(le, "slow") or string.find(le, "again") or string.find(le, "second") or string.find(le, "minute") or string.find(le, "limit") then
+								hitCooldown, cleanStreak, cooldownHits = true, 0, cooldownHits + 1
+								if cooldownHits <= Cfg.MAX_COOLDOWN_RETRIES then
+									local waitSec, hasExact = F.parseCooldownSeconds(errStr, cooldownHits)
+									if hasExact and lastSuccessClock > 0 then
+										local totalCd = (os.clock() - lastSuccessClock) + waitSec
+										if totalCd >= userMinDelay and totalCd <= 65 then adaptiveDelay = math.ceil(totalCd * 10) / 10 end
+									end
+									local cdPfx = waitSec >= 1.0 and string.format("%s[%d/%d | %d left] Cooldown -> %s", waveTag, rIdx, waveTotal, remAccBefore, recipient) or nil
+									if not F.waitInterruptible(waitSec, cdPfx) then stopReason = "Stopped." break end
+								else
+									skipRecipient, recipientFailReason = true, "Cooldown retries exhausted: " .. errStr; break
+								end
+							elseif string.find(le, "item") and (string.find(le, "found") or string.find(le, "exist") or string.find(le, "missing") or string.find(le, "enough")) then
+								maxRemainingByUid[cand.uid] = 0; staleRetries = staleRetries + 1
+								if staleRetries <= 3 then
+									F.syncLiveInventoryUI(true)
+									local fs, fok = F.collectBatchCandidateUids(targetPet.lowerId, targetMut)
+									if fok and fs then batchStacks = fs end
+									retryFreshStack = true
+								else
+									skipRecipient, recipientFailReason = true, errStr
+								end
+								break
+							elseif F.isPermanentSendError(errStr) then
+								skipRecipient, recipientFailReason, recipientPerm = true, errStr, true; break
 							else
-								cleanStreak = cleanStreak + 1
-								if adaptiveDelay > userMinDelay then
-									if adaptiveDelay < 10 and cleanStreak >= 2 then
-										cleanStreak = 0
-										adaptiveDelay = math.max(userMinDelay, math.floor((userMinDelay + (adaptiveDelay - userMinDelay) * 0.5) * 10) / 10)
-										if adaptiveDelay - userMinDelay < 0.15 then adaptiveDelay = userMinDelay end
-									elseif adaptiveDelay >= 10 and cleanStreak >= 5 then
-										cleanStreak = 0; adaptiveDelay = math.max(userMinDelay, adaptiveDelay - 1.0)
+								transientRetries = transientRetries + 1
+								if transientRetries <= Cfg.MAX_TRANSIENT_RETRIES then
+									local rWait = math.min(2.0, 0.35 * transientRetries)
+									local rPfx = string.format("%s[%d/%d] Auto-Retry %d/%d -> %s (%s)", waveTag, rIdx, waveTotal, transientRetries, Cfg.MAX_TRANSIENT_RETRIES, recipient, errStr)
+									if not F.waitInterruptible(rWait, rPfx) then stopReason = "Stopped." break end
+								else
+									skipRecipient, recipientFailReason = true, errStr; break
+								end
+							end
+						end
+
+						if S.cancelRequested or S.isDestroyed or skipRecipient then break end
+						if sentOk then
+							if lastSuccessClock > 0 then
+								if hitCooldown then
+									local gap = successFireClock - lastSuccessClock
+									if gap >= userMinDelay and gap <= 65 then adaptiveDelay = math.max(adaptiveDelay, math.ceil((gap + 0.05) * 10) / 10) end
+								else
+									cleanStreak = cleanStreak + 1
+									if adaptiveDelay > userMinDelay then
+										if adaptiveDelay < 10 and cleanStreak >= 2 then
+											cleanStreak = 0
+											adaptiveDelay = math.max(userMinDelay, math.floor((userMinDelay + (adaptiveDelay - userMinDelay) * 0.5) * 10) / 10)
+											if adaptiveDelay - userMinDelay < 0.15 then adaptiveDelay = userMinDelay end
+										elseif adaptiveDelay >= 10 and cleanStreak >= 5 then
+											cleanStreak = 0; adaptiveDelay = math.max(userMinDelay, adaptiveDelay - 1.0)
+										end
 									end
 								end
 							end
+							lastSuccessClock = successFireClock
+							maxRemainingByUid[cand.uid] = math.max(0, cand.cappedAm - sendAmt)
+							taskItem.remaining = math.max(0, taskItem.remaining - sendAmt)
+							totalSent, totalMails = totalSent + sendAmt, totalMails + 1
+							F.syncLiveInventoryUI(true)
+						elseif retryFreshStack then
+							if not F.waitInterruptible(0.15, nil) then stopReason = "Stopped." break end
+						else
+							skipRecipient, recipientFailReason = true, (attemptErr ~= "" and attemptErr) or "Failed to send"; break
 						end
-						lastSuccessClock = successFireClock
-						maxRemainingByUid[cand.uid] = math.max(0, cand.cappedAm - sendAmt)
-						remainingQty, sentForThisUser, totalSent, totalMails = remainingQty - sendAmt, sentForThisUser + sendAmt, totalSent + sendAmt, totalMails + 1
-						F.syncLiveInventoryUI(true)
-					elseif retryFreshStack then
-						if not F.waitInterruptible(0.15, nil) then stopReason = "Stopped." break end
-					else
-						skipRecipient, recipientFailReason = true, (attemptErr ~= "" and attemptErr) or "Failed to send"; break
+					end
+
+					if taskItem.remaining <= 0 then
+						usersCompleted = usersCompleted + 1
+						if failedMap[recipient] ~= nil then
+							failedMap[recipient] = nil
+							totalFailed = math.max(0, totalFailed - 1)
+						end
+						if activeMode == "multi" then S.currentBatchCompletedSet[recipient] = true; F.recordSentLog(recipient) end
+					elseif not S.cancelRequested and not S.isDestroyed then
+						taskItem.reason = tostring(recipientFailReason or "incomplete")
+						taskItem.perm = recipientPerm
+						if failedMap[recipient] == nil then totalFailed = totalFailed + 1 end
+						failedMap[recipient] = taskItem.reason
+					end
+
+					local remWave = math.max(0, waveTotal - rIdx)
+					F.setProgress(wave == 0 and ((usersCompleted + totalFailed) / math.max(1, totalRecipients)) or (usersCompleted / math.max(1, totalRecipients)))
+					if activeMode == "multi" then
+						F.updateMultiCounters(totalRecipients, remWave, usersCompleted, totalFailed)
+						local el = math.max(0.01, os.clock() - batchStartClock)
+						local rpm = usersCompleted > 0 and (usersCompleted / el * 60) or 0
+						local eta = usersCompleted > 0 and ((el / usersCompleted) * remWave) or 0
+						F.setStatus(string.format("%sDone %d/%d | %d accs left | %.1f acc/m • ETA %s (%s)", waveTag, usersCompleted, totalRecipients, remWave, rpm, F.formatEta(eta), recipient), Color3.fromRGB(125, 225, 165))
 					end
 				end
 
-				if sentForThisUser >= qtyPerUser then
-					usersCompleted = usersCompleted + 1
-					if activeMode == "multi" then S.currentBatchCompletedSet[recipient] = true; F.recordSentLog(recipient) end
-				elseif not S.cancelRequested and not S.isDestroyed then
-					totalFailed = totalFailed + 1
-					table.insert(failedUserNotes, recipient .. ": " .. tostring(recipientFailReason or "incomplete"))
+				if S.cancelRequested or S.isDestroyed then break end
+				local nextWave = {}
+				for _, item in ipairs(waveQueue) do
+					if item.remaining > 0 and not item.perm then table.insert(nextWave, item) end
 				end
+				if #nextWave == 0 or wave >= Cfg.AUTO_RETRY_PASSES then break end
 
-				local processed = usersCompleted + totalFailed
-				local remNow = math.max(0, totalRecipients - processed)
-				F.setProgress(processed / math.max(1, totalRecipients))
-				if activeMode == "multi" then
-					F.updateMultiCounters(totalRecipients, remNow, usersCompleted, totalFailed)
-					local el = math.max(0.01, os.clock() - batchStartClock)
-					local rpm = usersCompleted > 0 and (usersCompleted / el * 60) or 0
-					local eta = usersCompleted > 0 and ((el / usersCompleted) * remNow) or 0
-					F.setStatus(string.format("Done %d/%d | %d accs left | %.1f acc/m • ETA %s (%s)", usersCompleted, totalRecipients, remNow, rpm, F.formatEta(eta), recipient), Color3.fromRGB(125, 225, 165))
+				wave = wave + 1
+				if not F.waitInterruptible(Cfg.RETRY_WAVE_DELAY, string.format("Auto-Retry wave %d/%d for %d failed accs", wave, Cfg.AUTO_RETRY_PASSES, #nextWave)) then
+					stopReason = "Stopped."; break
 				end
+				local freshStacks, freshOk = F.collectBatchCandidateUids(targetPet.lowerId, targetMut)
+				if freshOk and freshStacks then batchStacks = freshStacks end
+				waveQueue = nextWave
+			end
+
+			for _, name in ipairs(recipients) do
+				if failedMap[name] then table.insert(failedUserNotes, name .. ": " .. failedMap[name]) end
 			end
 		end)
 
@@ -1985,19 +2053,24 @@ function F.startSending()
 		F.setSendingVisual(false)
 		F.syncLiveInventoryUI(true)
 		F.refreshUnsentButtons()
+		if activeMode == "multi" then
+			local remEnd = stopReason and math.max(0, totalRecipients - (usersCompleted + totalFailed)) or 0
+			F.updateMultiCounters(totalRecipients, remEnd, usersCompleted, totalFailed)
+		end
 
 		local elapsedSec = math.max(0.01, os.clock() - batchStartClock)
 		local totalDur, spm = F.formatEta(elapsedSec), usersCompleted > 0 and (usersCompleted / elapsedSec * 60) or 0
+		local retryTag = (waveUsed > 0) and (" [Auto-Retry x" .. tostring(waveUsed) .. "]") or ""
 		if not okRun then
 			F.setStatus("Runtime error: " .. tostring(runErr), Color3.fromRGB(245, 100, 100))
 		elseif stopReason then
 			F.setStatus(string.format("%s (%d/%d accs | %s sent | %s)", stopReason, usersCompleted, totalRecipients, F.formatNumber(totalSent), totalDur), Color3.fromRGB(245, 165, 110))
 		elseif totalFailed > 0 then
-			F.setStatus(string.format("Done %d/%d accs (%s | %.1f/m) | %d fail: %s", usersCompleted, totalRecipients, totalDur, spm, totalFailed, table.concat(failedUserNotes, "; ")), Color3.fromRGB(245, 145, 110))
+			F.setStatus(string.format("Done %d/%d accs (%s | %.1f/m)%s | %d fail: %s", usersCompleted, totalRecipients, totalDur, spm, retryTag, totalFailed, table.concat(failedUserNotes, "; ")), Color3.fromRGB(245, 145, 110))
 		elseif activeMode == "single" then
-			F.setStatus(string.format("Sent %s [%s] %s -> %s (%s)!", F.formatNumber(totalSent), targetMutLabel, targetPet.displayName, recipients[1], totalDur), Color3.fromRGB(115, 225, 155))
+			F.setStatus(string.format("Sent %s [%s] %s -> %s (%s)%s!", F.formatNumber(totalSent), targetMutLabel, targetPet.displayName, recipients[1], totalDur, retryTag), Color3.fromRGB(115, 225, 155))
 		else
-			F.setStatus(string.format("Finished %d/%d accs in %s! (%.1f acc/m | %s [%s] %s)", usersCompleted, totalRecipients, totalDur, spm, F.formatNumber(totalSent), targetMutLabel, targetPet.displayName), Color3.fromRGB(115, 225, 155))
+			F.setStatus(string.format("Finished %d/%d accs in %s%s! (%.1f acc/m | %s [%s] %s)", usersCompleted, totalRecipients, totalDur, retryTag, spm, F.formatNumber(totalSent), targetMutLabel, targetPet.displayName), Color3.fromRGB(115, 225, 155))
 		end
 	end)
 end
