@@ -1,0 +1,2183 @@
+-- PS99 Auto Mailbox v12 (Pure Lua | Register-Safe + Split Single/Multi + Live Inv Sync + Huge Filter + Anti-AFK + Sent Log)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local unpackFn = table.unpack or unpack
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+	Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+	LocalPlayer = Players.LocalPlayer
+end
+
+local globalEnv = (type(getgenv) == "function" and getgenv()) or _G
+if type(globalEnv.PS99_AutoMailbox_Cleanup) == "function" then
+	pcall(globalEnv.PS99_AutoMailbox_Cleanup)
+end
+
+local Cfg = {
+	MAIL_MESSAGE = "", -- Empty avoids PS99's 60s message cooldown!
+	DEFAULT_SEND_DELAY = 0.0,
+	MIN_SEND_DELAY = 0.0,
+	MAX_COOLDOWN_RETRIES = 25,
+	MAX_RESULTS = 45,
+	MAILBOX_MAX_DIST = 18,
+	REQUIRE_TIMEOUT = 1.2,
+	CALL_TIMEOUT_FAST = 0.35,
+	INVOKE_TIMEOUT = 8.0,
+	GC_YIELD_STEP = 15000,
+	GC_TIME_BUDGET = 6.0,
+	SENT_LOG_FILE = "PS99_Mailbox_SentLog.txt",
+	FILTER_TABS = {
+		{ key = "all", label = "All", short = "ALL", color = Color3.fromRGB(38, 166, 107), isCategory = true },
+		{ key = "huge", label = "Huge", short = "HUGE", color = Color3.fromRGB(232, 114, 46), isCategory = true },
+		{ key = "normal", label = "Base", short = "BASE", color = Color3.fromRGB(82, 98, 122) },
+		{ key = "golden", label = "Golden", short = "GOLD", color = Color3.fromRGB(214, 156, 36) },
+		{ key = "rainbow", label = "Rainbow", short = "RB", color = Color3.fromRGB(52, 148, 224) },
+		{ key = "shiny", label = "Shiny", short = "SHINY", color = Color3.fromRGB(108, 174, 214) },
+		{ key = "shiny_golden", label = "Sh.Gold", short = "SH.G", color = Color3.fromRGB(228, 178, 62) },
+		{ key = "shiny_rainbow", label = "Sh.RB", short = "SH.RB", color = Color3.fromRGB(172, 88, 224) },
+	},
+	MUTATION_ORDER = { normal = 1, golden = 2, rainbow = 3, shiny = 4, shiny_golden = 5, shiny_rainbow = 6 },
+}
+
+local S = {
+	connections = {},
+	mutConnections = {},
+	activeThreads = {},
+	isDestroyed = false,
+	isSending = false,
+	isScanning = false,
+	cancelRequested = false,
+	sendThread = nil,
+	activeInvokeThread = nil,
+	activeTimeoutThread = nil,
+
+	sendMode = "multi",
+	skipEquipped = true,
+	antiAfkEnabled = true,
+	singleWarnNote = nil,
+	sanitizingSingleBox = false,
+	isMinimized = false,
+
+	modulesLoaded = false,
+	catalogBuilt = false,
+	dirOrderReady = false,
+	cachedMailboxPart = nil,
+	cachedMailboxRemote = nil,
+
+	cachedSaveTable = nil,
+	activeSaveSource = "Not scanned",
+	cachedGcNetwork = nil,
+	cachedGcPetNet = nil,
+	saveModDead = false,
+	petNetDead = false,
+
+	SaveMod = nil,
+	NetworkMod = nil,
+	PetNetworking = nil,
+	ConstantsMod = nil,
+	MailboxTypesMod = nil,
+	FFlagsMod = nil,
+	DirectoryFolder = nil,
+	PetDirectory = {},
+
+	allPets = {},
+	ownedPetsList = {},
+	petByLowerId = {},
+	dirOrderMap = {},
+	cachedDirMutations = nil,
+	statsByPetAndMut = {},
+
+	selectedEntry = nil,
+	selectedMutFilter = "all",
+	lastUnsentRecipients = {},
+	currentBatchRecipients = nil,
+	currentBatchCompletedSet = nil,
+
+	sentLogSet = {},
+	sentLogCount = 0,
+	lastRecipRaw = nil,
+	cachedRecipients = {},
+	cachedInvalidCount = 0,
+
+	activeFilters = {},
+	filterMetaByKey = {},
+	lastMutationSignature = "",
+	resultSlots = {},
+}
+
+local UI = {}
+local F = {}
+
+-- Utility Helpers
+function F.trackConn(conn)
+	if conn then
+		table.insert(S.connections, conn)
+	end
+	return conn
+end
+
+function F.trackThread(th)
+	for i = #S.activeThreads, 1, -1 do
+		local old = S.activeThreads[i]
+		if not old or coroutine.status(old) == "dead" then
+			table.remove(S.activeThreads, i)
+		end
+	end
+	if th then
+		table.insert(S.activeThreads, th)
+	end
+	return th
+end
+
+function F.clearConnList(list)
+	for i = #list, 1, -1 do
+		local c = list[i]
+		if c and c.Connected then
+			c:Disconnect()
+		end
+		list[i] = nil
+	end
+end
+
+function F.tweenProp(inst, props, dur)
+	if not inst or not inst.Parent then
+		return nil
+	end
+	local ok, tw = pcall(function()
+		local t = TweenService:Create(inst, TweenInfo.new(dur or 0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+		t:Play()
+		return t
+	end)
+	return ok and tw or nil
+end
+
+function F.isValidFiniteNumber(n)
+	return type(n) == "number" and n == n and math.abs(n) ~= math.huge
+end
+
+function F.trimString(str)
+	if type(str) ~= "string" then
+		return ""
+	end
+	return string.match(string.gsub(str, "%c", ""), "^%s*(.-)%s*$") or ""
+end
+
+function F.formatNumber(n)
+	if not F.isValidFiniteNumber(n) then
+		return "0"
+	end
+	local s = tostring(math.abs(math.floor(n)))
+	while true do
+		local k
+		s, k = string.gsub(s, "^(-?%d+)(%d%d%d)", "%1,%2")
+		if k == 0 then
+			break
+		end
+	end
+	return (n < 0 and "-" or "") .. s
+end
+
+function F.formatCompact(n)
+	if not F.isValidFiniteNumber(n) then
+		return "0"
+	end
+	local a = math.abs(n)
+	if a >= 1e9 then
+		return string.format("%.2fB", n / 1e9)
+	elseif a >= 1e6 then
+		return string.format("%.2fM", n / 1e6)
+	elseif a >= 1e4 then
+		return string.format("%.1fK", n / 1e3)
+	end
+	return F.formatNumber(n)
+end
+
+function F.formatEta(seconds)
+	if not F.isValidFiniteNumber(seconds) or seconds <= 0 then
+		return "0s"
+	end
+	local s = math.floor(seconds + 0.5)
+	if s >= 60 then
+		return string.format("%dm%02ds", math.floor(s / 60), s % 60)
+	end
+	return tostring(s) .. "s"
+end
+
+function F.normalizeAssetId(raw)
+	if type(raw) == "number" and F.isValidFiniteNumber(raw) and raw > 0 then
+		return "rbxassetid://" .. tostring(math.floor(raw))
+	end
+	if type(raw) == "string" and raw ~= "" then
+		if string.find(raw, "://", 1, true) then
+			return raw
+		end
+		if string.match(raw, "^%d+$") then
+			return "rbxassetid://" .. raw
+		end
+	end
+	return ""
+end
+
+-- Persistent Sent Log Helpers
+function F.loadSentLogFromFile()
+	S.sentLogSet = {}
+	S.sentLogCount = 0
+	if type(isfile) ~= "function" or type(readfile) ~= "function" then
+		return
+	end
+	local okEx, ex = pcall(isfile, Cfg.SENT_LOG_FILE)
+	if not okEx or not ex then
+		return
+	end
+	local okRd, content = pcall(readfile, Cfg.SENT_LOG_FILE)
+	if not okRd or type(content) ~= "string" then
+		return
+	end
+	for line in string.gmatch(content, "[^\r\n]+") do
+		local clean = F.trimString(line)
+		if clean ~= "" then
+			local low = string.lower(clean)
+			if not S.sentLogSet[low] then
+				S.sentLogSet[low] = true
+				S.sentLogCount = S.sentLogCount + 1
+			end
+		end
+	end
+end
+
+function F.recordSentLog(username)
+	if type(username) ~= "string" or username == "" then
+		return
+	end
+	local low = string.lower(username)
+	if S.sentLogSet[low] then
+		return
+	end
+	S.sentLogSet[low] = true
+	S.sentLogCount = S.sentLogCount + 1
+	if type(appendfile) == "function" then
+		pcall(appendfile, Cfg.SENT_LOG_FILE, username .. "\n")
+	elseif type(writefile) == "function" then
+		local prev = ""
+		if type(isfile) == "function" and type(readfile) == "function" then
+			local okEx, ex = pcall(isfile, Cfg.SENT_LOG_FILE)
+			if okEx and ex then
+				local okRd, rd = pcall(readfile, Cfg.SENT_LOG_FILE)
+				if okRd and type(rd) == "string" then
+					prev = rd
+				end
+			end
+		end
+		pcall(writefile, Cfg.SENT_LOG_FILE, prev .. username .. "\n")
+	end
+end
+
+function F.clearSentLogFile()
+	S.sentLogSet = {}
+	S.sentLogCount = 0
+	if type(writefile) == "function" then
+		pcall(writefile, Cfg.SENT_LOG_FILE, "")
+	elseif type(delfile) == "function" and type(isfile) == "function" then
+		local okEx, ex = pcall(isfile, Cfg.SENT_LOG_FILE)
+		if okEx and ex then
+			pcall(delfile, Cfg.SENT_LOG_FILE)
+		end
+	end
+end
+
+-- Event-driven anti-hang wrapper
+function F.callWithTimeout(fn, timeoutSec, cancelableBySend, ...)
+	if type(fn) ~= "function" then
+		return false, "not_a_function", false, nil
+	end
+	local args = { ... }
+	local argCount = select("#", ...)
+	local caller = coroutine.running()
+	local done, waiting, ok, r1, r2, timeoutThread = false, false, false, nil, nil, nil
+
+	local th = task.spawn(function()
+		ok, r1, r2 = pcall(fn, unpackFn(args, 1, argCount))
+		done = true
+		if timeoutThread then
+			pcall(task.cancel, timeoutThread)
+			timeoutThread = nil
+		end
+		if cancelableBySend and S.activeTimeoutThread then
+			S.activeTimeoutThread = nil
+		end
+		if waiting then
+			waiting = false
+			if coroutine.status(caller) == "suspended" then
+				task.spawn(caller)
+			end
+		end
+	end)
+
+	if not done then
+		waiting = true
+		if cancelableBySend then
+			S.activeInvokeThread = th
+		end
+		timeoutThread = task.delay(timeoutSec or Cfg.CALL_TIMEOUT_FAST, function()
+			if not done and waiting then
+				waiting = false
+				if coroutine.status(caller) == "suspended" then
+					task.spawn(caller)
+				end
+			end
+		end)
+		if cancelableBySend then
+			S.activeTimeoutThread = timeoutThread
+		end
+		coroutine.yield()
+	end
+
+	if cancelableBySend then
+		if S.activeInvokeThread == th then
+			S.activeInvokeThread = nil
+		end
+		if S.activeTimeoutThread == timeoutThread then
+			S.activeTimeoutThread = nil
+		end
+	end
+	if timeoutThread then
+		pcall(task.cancel, timeoutThread)
+		timeoutThread = nil
+	end
+	if not done then
+		if coroutine.status(th) ~= "dead" then
+			pcall(task.cancel, th)
+		end
+		return false, "Timeout (" .. tostring(timeoutSec) .. "s)", true, nil
+	end
+	return ok, r1, false, r2
+end
+
+function F.requireWithTimeout(inst, timeoutSec)
+	if not inst or not inst:IsA("ModuleScript") then
+		return nil
+	end
+	local ok, mod, timedOut = F.callWithTimeout(require, timeoutSec or Cfg.REQUIRE_TIMEOUT, false, inst)
+	if ok and not timedOut and type(mod) == "table" then
+		return mod
+	end
+	return nil
+end
+
+function F.getItemAmount(item)
+	local raw = rawget(item, "_am") or rawget(item, "am") or rawget(item, "amount")
+	if F.isValidFiniteNumber(raw) and raw >= 1 then
+		return math.floor(raw)
+	end
+	return 1
+end
+
+function F.isItemLocked(item)
+	return rawget(item, "_lk") == true or rawget(item, "lk") == true
+end
+
+function F.isItemMarkedEquipped(item)
+	return rawget(item, "_eq") == true or rawget(item, "eq") == true
+end
+
+function F.getItemMutationInfo(item)
+	local ptRaw = rawget(item, "pt")
+	local pt = (ptRaw == 1 or ptRaw == 2) and ptRaw or 0
+	local sh = (rawget(item, "sh") == true)
+	local baseKey = (pt == 2 and sh and "shiny_rainbow")
+		or (pt == 1 and sh and "shiny_golden")
+		or (sh and "shiny")
+		or (pt == 2 and "rainbow")
+		or (pt == 1 and "golden")
+		or "normal"
+
+	local extras = {}
+	local fields = { "mutation", "mutations", "mut", "mt", "_mt", "variant", "traits" }
+	for i = 1, #fields do
+		local val = rawget(item, fields[i])
+		if type(val) == "string" and val ~= "" then
+			table.insert(extras, val)
+		elseif type(val) == "table" then
+			for k, v in pairs(val) do
+				if type(v) == "string" and v ~= "" then
+					table.insert(extras, v)
+				elseif v == true and type(k) == "string" and k ~= "" then
+					table.insert(extras, k)
+				end
+			end
+		end
+	end
+	return (#extras > 0 and ("extra:" .. string.lower(extras[1])) or baseKey), baseKey, extras, pt, sh
+end
+
+function F.itemMatchesExactMutation(item, targetMutKey)
+	if targetMutKey == "all" or targetMutKey == "huge" then
+		return true
+	end
+	local primaryKey, baseKey, extras = F.getItemMutationInfo(item)
+	if string.sub(targetMutKey, 1, 6) == "extra:" then
+		local wanted = string.sub(targetMutKey, 7)
+		for i = 1, #extras do
+			if string.lower(extras[i]) == wanted then
+				return true
+			end
+		end
+		return false
+	end
+	return primaryKey == targetMutKey or (primaryKey == baseKey and baseKey == targetMutKey)
+end
+
+function F.initGameModulesAsync()
+	if S.modulesLoaded then
+		return
+	end
+	local libInst = ReplicatedStorage:FindFirstChild("Library") or ReplicatedStorage:WaitForChild("Library", 5)
+	if not libInst then
+		return
+	end
+	local clientFolder = libInst:FindFirstChild("Client")
+	local balancingFolder = libInst:FindFirstChild("Balancing")
+	local typesFolder = libInst:FindFirstChild("Types")
+	S.DirectoryFolder = libInst:FindFirstChild("Directory")
+
+	local pending = 0
+	local function spawnLoad(inst, timeoutSec, onLoaded)
+		if not inst or not inst:IsA("ModuleScript") then
+			return
+		end
+		pending = pending + 1
+		task.spawn(function()
+			local mod = F.requireWithTimeout(inst, timeoutSec)
+			if mod and not S.isDestroyed then
+				onLoaded(mod)
+			end
+			pending = pending - 1
+		end)
+	end
+
+	spawnLoad(S.DirectoryFolder, 1.8, function(dirMod)
+		local okP, tbl = pcall(function() return dirMod.Pets end)
+		if okP and type(tbl) == "table" and next(tbl) ~= nil then S.PetDirectory = tbl end
+	end)
+	if S.DirectoryFolder then
+		spawnLoad(S.DirectoryFolder:FindFirstChild("Pets"), 1.8, function(tbl)
+			if next(S.PetDirectory) == nil then S.PetDirectory = tbl end
+		end)
+	end
+	spawnLoad(clientFolder and clientFolder:FindFirstChild("Save") or libInst:FindFirstChild("Save"), 1.0, function(m) S.SaveMod = m end)
+	spawnLoad(clientFolder and clientFolder:FindFirstChild("Network"), 0.8, function(m) S.NetworkMod = m end)
+	spawnLoad(clientFolder and clientFolder:FindFirstChild("PetNetworking"), 0.8, function(m) S.PetNetworking = m end)
+	spawnLoad(clientFolder and clientFolder:FindFirstChild("FFlags"), 0.8, function(m) S.FFlagsMod = m end)
+	spawnLoad(balancingFolder and balancingFolder:FindFirstChild("Constants"), 0.8, function(m) S.ConstantsMod = m end)
+	spawnLoad(typesFolder and typesFolder:FindFirstChild("Mailbox"), 0.8, function(m) S.MailboxTypesMod = m end)
+
+	local deadline = os.clock() + 2.0
+	while pending > 0 and os.clock() < deadline and not S.isDestroyed do
+		task.wait(0.04)
+	end
+	S.modulesLoaded = true
+end
+
+function F.scoreSaveTable(t)
+	if type(t) ~= "table" then return 0 end
+	local inv = rawget(t, "Inventory")
+	if type(inv) ~= "table" then return 0 end
+	local pets = rawget(inv, "Pet")
+	if type(pets) ~= "table" then return 0 end
+	local score = 1
+	if type(rawget(inv, "Currency")) == "table" then score = score + 4 end
+	if rawget(t, "Rebirths") ~= nil then score = score + 2 end
+	if rawget(t, "Rank") ~= nil then score = score + 2 end
+	if rawget(t, "UnlockedZones") ~= nil then score = score + 2 end
+	if rawget(t, "MailboxSendsSinceReset") ~= nil or rawget(t, "MailboxResetTime") ~= nil then score = score + 2 end
+	if rawget(t, "Achievements") ~= nil then score = score + 1 end
+	if score < 3 then return 0 end
+	local petSlots = 0
+	for _ in pairs(pets) do
+		petSlots = petSlots + 1
+		if petSlots >= 20 then break end
+	end
+	return score * 100 + petSlots
+end
+
+function F.extractSaveFromResult(res)
+	if type(res) ~= "table" then return nil end
+	if F.scoreSaveTable(res) > 0 then return res end
+	local inner = rawget(res, "Save")
+	if type(inner) == "table" and F.scoreSaveTable(inner) > 0 then return inner end
+	return nil
+end
+
+function F.resolveLiveSave(forceRescan, progressCb)
+	if not forceRescan and S.cachedSaveTable and F.scoreSaveTable(S.cachedSaveTable) > 0 then
+		return S.cachedSaveTable, S.activeSaveSource
+	end
+	if not S.saveModDead and type(S.SaveMod) == "table" then
+		for _, fnName in ipairs({ "Get", "GetData", "GetSave" }) do
+			local fn = rawget(S.SaveMod, fnName)
+			if type(fn) == "function" then
+				local ok1, res1, to1 = F.callWithTimeout(fn, Cfg.CALL_TIMEOUT_FAST, false)
+				if to1 then S.saveModDead = true break end
+				local s1 = ok1 and F.extractSaveFromResult(res1) or nil
+				if s1 then
+					S.cachedSaveTable = s1
+					S.activeSaveSource = "Save." .. fnName
+					return s1, S.activeSaveSource
+				end
+			end
+		end
+	end
+
+	if type(getgc) == "function" then
+		if progressCb then progressCb("Scanning memory (GC)...") end
+		local okGc, gcList = pcall(getgc, true)
+		if okGc and type(gcList) == "table" then
+			local totalObjs, bestTable, bestScore, startClock, scanned = #gcList, nil, 0, os.clock(), 0
+			for i = totalObjs, 1, -1 do
+				if S.isDestroyed then return nil, "Closed" end
+				scanned = scanned + 1
+				local obj = gcList[i]
+				if type(obj) == "table" then
+					if rawget(obj, "Inventory") ~= nil then
+						local sc = F.scoreSaveTable(obj)
+						if sc > bestScore then
+							bestScore, bestTable = sc, obj
+							if bestScore >= 901 then
+								S.cachedSaveTable = bestTable
+								S.activeSaveSource = "GC-Fast"
+								return bestTable, S.activeSaveSource
+							end
+						end
+					elseif not S.cachedGcPetNet and type(rawget(obj, "EquippedPets")) == "function" then
+						S.cachedGcPetNet = obj
+					elseif not S.cachedGcNetwork and type(rawget(obj, "Invoke")) == "function" and type(rawget(obj, "Fire")) == "function" then
+						if type(rawget(obj, "Fired")) == "function" or type(rawget(obj, "Invoked")) == "function" then
+							S.cachedGcNetwork = obj
+						end
+					end
+				end
+				if scanned % Cfg.GC_YIELD_STEP == 0 then
+					if progressCb then progressCb(string.format("Scanning GC (%d%%)...", math.floor((scanned / totalObjs) * 100))) end
+					if os.clock() - startClock > Cfg.GC_TIME_BUDGET then break end
+					task.wait()
+				end
+			end
+			if bestTable then
+				S.cachedSaveTable = bestTable
+				S.activeSaveSource = "GC-Table"
+				return bestTable, S.activeSaveSource
+			end
+		end
+	end
+
+	local getUpvaluesFn = (type(debug) == "table" and debug.getupvalues) or getupvalues
+	local debugInfoFn = type(debug) == "table" and debug.info or nil
+	if type(getgc) == "function" and type(getUpvaluesFn) == "function" then
+		if progressCb then progressCb("Scanning Upvalues...") end
+		local okGc, gcFuncs = pcall(getgc, false)
+		if okGc and type(gcFuncs) == "table" then
+			local bestTable, bestScore, startClock = nil, 0, os.clock()
+			for i = 1, #gcFuncs do
+				if S.isDestroyed then return nil, "Closed" end
+				local fn = gcFuncs[i]
+				if type(fn) == "function" then
+					local inspect = true
+					if debugInfoFn then
+						local okI, src = pcall(debugInfoFn, fn, "s")
+						if okI and type(src) == "string" then
+							local ls = string.lower(src)
+							inspect = string.find(ls, "save", 1, true) ~= nil or string.find(ls, "inventory", 1, true) ~= nil or string.find(ls, "client", 1, true) ~= nil
+						end
+					end
+					if inspect then
+						local okUp, ups = pcall(getUpvaluesFn, fn)
+						if okUp and type(ups) == "table" then
+							for _, val in pairs(ups) do
+								if type(val) == "table" and rawget(val, "Inventory") ~= nil then
+									local sc = F.scoreSaveTable(val)
+									if sc > bestScore then
+										bestScore, bestTable = sc, val
+										if bestScore >= 901 then
+											S.cachedSaveTable = bestTable
+											S.activeSaveSource = "GC-Upvalue"
+											return bestTable, S.activeSaveSource
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+				if i % 4000 == 0 then
+					if os.clock() - startClock > Cfg.GC_TIME_BUDGET then break end
+					task.wait()
+				end
+			end
+			if bestTable then
+				S.cachedSaveTable = bestTable
+				S.activeSaveSource = "GC-Upvalue"
+				return bestTable, S.activeSaveSource
+			end
+		end
+	end
+
+	S.cachedSaveTable = nil
+	S.activeSaveSource = "Failed to read Save"
+	return nil, S.activeSaveSource
+end
+
+function F.getEquippedCountByUid(save)
+	local counts = {}
+	local function ingest(tbl)
+		if type(tbl) ~= "table" then return end
+		for k, v in pairs(tbl) do
+			if type(v) == "table" then
+				local uid = rawget(v, "uid") or rawget(v, "_uid") or rawget(v, "UID")
+				if type(uid) == "string" then counts[uid] = (counts[uid] or 0) + 1 end
+			elseif type(v) == "string" then
+				counts[v] = (counts[v] or 0) + 1
+			elseif v == true and type(k) == "string" then
+				counts[k] = (counts[k] or 0) + 1
+			end
+		end
+	end
+
+	if not S.petNetDead then
+		local petNet = S.PetNetworking or S.cachedGcPetNet
+		if type(petNet) == "table" then
+			for _, fnName in ipairs({ "EquippedPets", "GetEquipped" }) do
+				local fn = rawget(petNet, fnName)
+				if type(fn) == "function" then
+					local ok, res, timedOut = F.callWithTimeout(fn, Cfg.CALL_TIMEOUT_FAST, false)
+					if timedOut then S.petNetDead = true break end
+					if ok and type(res) == "table" then
+						local lpEntry = res[LocalPlayer] or res[LocalPlayer.UserId]
+						ingest(type(lpEntry) == "table" and lpEntry or res)
+						return counts
+					end
+				end
+			end
+		end
+	end
+	if type(save) == "table" then ingest(rawget(save, "EquippedPets")) end
+	return counts
+end
+
+function F.getDiamonds()
+	local best = 0
+	local save = S.cachedSaveTable
+	local inv = save and rawget(save, "Inventory")
+	local curr = type(inv) == "table" and rawget(inv, "Currency") or nil
+	if type(curr) == "table" then
+		local total = 0
+		for _, item in pairs(curr) do
+			if type(item) == "table" and rawget(item, "id") == "Diamonds" then
+				total = total + F.getItemAmount(item)
+			end
+		end
+		if total > best then best = total end
+	end
+	local ls = LocalPlayer:FindFirstChild("leaderstats")
+	if ls then
+		for _, child in ipairs(ls:GetChildren()) do
+			if (child:IsA("NumberValue") or child:IsA("IntValue")) and string.find(string.lower(child.Name), "diamond", 1, true) then
+				if F.isValidFiniteNumber(child.Value) and child.Value > best then best = math.floor(child.Value) end
+			end
+		end
+	end
+	return best
+end
+
+function F.getMailboxSendCost()
+	local baseCost = 20000
+	if type(S.ConstantsMod) == "table" and F.isValidFiniteNumber(rawget(S.ConstantsMod, "MailboxDiamondCost")) then
+		baseCost = math.floor(rawget(S.ConstantsMod, "MailboxDiamondCost"))
+	end
+	local feeMult = 1
+	if type(S.FFlagsMod) == "table" and type(rawget(S.FFlagsMod, "Get")) == "function" and type(rawget(S.FFlagsMod, "Keys")) == "table" then
+		local okM, valM = pcall(function() return S.FFlagsMod.Get(S.FFlagsMod.Keys.DiamondSink_MailboxFee_Mult) end)
+		if okM and type(valM) == "number" and F.isValidFiniteNumber(valM) and valM > 0 then feeMult = valM end
+	end
+	local flatCost = math.floor(baseCost * feeMult)
+	if LocalPlayer:GetAttribute("Partner") == true then return flatCost end
+	local save = S.cachedSaveTable
+	if type(save) ~= "table" then return flatCost end
+	local gp = rawget(save, "Gamepasses")
+	if type(gp) == "table" and rawget(gp, "VIP") == true then return flatCost end
+
+	local resetTime = rawget(save, "MailboxResetTime")
+	local okNow, serverNow = pcall(function() return workspace:GetServerTimeNow() end)
+	if not okNow or not F.isValidFiniteNumber(serverNow) or type(resetTime) ~= "number" or resetTime < serverNow then
+		return flatCost
+	end
+
+	local sends = rawget(save, "MailboxSendsSinceReset")
+	if not F.isValidFiniteNumber(sends) or sends < 0 then sends = 0 end
+	local growthRate, costCap = 1.5, 5000000
+	if type(S.MailboxTypesMod) == "table" then
+		if F.isValidFiniteNumber(rawget(S.MailboxTypesMod, "DiamondCostGrowthRate")) then growthRate = rawget(S.MailboxTypesMod, "DiamondCostGrowthRate") end
+		if F.isValidFiniteNumber(rawget(S.MailboxTypesMod, "DiamondCostCap")) then costCap = rawget(S.MailboxTypesMod, "DiamondCostCap") end
+	end
+	return math.min(math.floor(flatCost * math.pow(growthRate, sends)), math.floor(costCap * feeMult))
+end
+
+function F.findNearestMailboxPos()
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local origin = root and root.Position or Vector3.new(0, 0, 0)
+	if S.cachedMailboxPart and S.cachedMailboxPart.Parent and S.cachedMailboxPart:IsDescendantOf(workspace) then
+		local pos = S.cachedMailboxPart.Position
+		local dist = (pos - origin).Magnitude
+		if dist < 2500 then return pos, dist end
+	end
+	S.cachedMailboxPart = nil
+
+	local bestPos, bestPart, bestDist = nil, nil, math.huge
+	local function considerPos(pos, partRef)
+		if typeof(pos) ~= "Vector3" then return end
+		local dist = (pos - origin).Magnitude
+		if dist < bestDist then bestDist, bestPos, bestPart = dist, pos, partRef end
+	end
+	local function scanContainer(container)
+		if not container then return end
+		for _, obj in ipairs(container:GetDescendants()) do
+			if obj:IsA("Model") or obj:IsA("BasePart") then
+				if string.find(string.lower(obj.Name), "mailbox", 1, true) then
+					if obj:IsA("BasePart") then
+						considerPos(obj.Position, obj)
+					else
+						local pad = obj:FindFirstChild("Pad", true) or obj:FindFirstChild("Interact", true) or obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
+						if pad and pad:IsA("BasePart") then
+							considerPos(pad.Position, pad)
+						else
+							local okP, cf = pcall(function() return obj:GetPivot() end)
+							if okP and typeof(cf) == "CFrame" then considerPos(cf.Position, nil) end
+						end
+					end
+				end
+			elseif obj:IsA("TextLabel") then
+				local txt = string.lower(obj.Text or "")
+				if string.find(txt, "send and receive gifts", 1, true) or txt == "mailbox" then
+					local anc = obj:FindFirstAncestorWhichIsA("BasePart")
+					if anc then
+						considerPos(anc.Position, anc)
+					else
+						local model = obj:FindFirstAncestorWhichIsA("Model")
+						local anyPart = model and model:FindFirstChildWhichIsA("BasePart", true)
+						if anyPart then considerPos(anyPart.Position, anyPart) end
+					end
+				end
+			end
+		end
+	end
+
+	local things = workspace:FindFirstChild("__THINGS")
+	if things then scanContainer(things:FindFirstChild("Mailboxes")) end
+	if not bestPos then
+		local mapFolder = workspace:FindFirstChild("Map") or workspace:FindFirstChild("__MAP")
+		if mapFolder then
+			for _, z in ipairs(mapFolder:GetChildren()) do
+				local inter = z:FindFirstChild("INTERACT")
+				if inter then scanContainer(inter:FindFirstChild("Machines") or inter) end
+			end
+			if not bestPos then scanContainer(mapFolder) end
+		end
+	end
+	if not bestPos then scanContainer(workspace) end
+	if bestPart then S.cachedMailboxPart = bestPart end
+	return bestPos, bestDist
+end
+
+function F.moveToPhysicalMailbox()
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not char or not root then return false, "Character not found" end
+	local mbPos, dist = F.findNearestMailboxPos()
+	if not mbPos then return false, "Mailbox TP not needed (EF_Relay sends anywhere)" end
+	if dist <= Cfg.MAILBOX_MAX_DIST then return true, "Already near Mailbox" end
+	pcall(function() char:PivotTo(CFrame.new(mbPos + Vector3.new(0, 3.5, 3), mbPos + Vector3.new(0, 2, 0))) end)
+	task.wait(0.2)
+	return true, "Moved to Mailbox"
+end
+
+function F.rebuildMutationRegistry(discoveredExtras)
+	local newFilters, newMeta, addedExtra = {}, {}, {}
+	for _, entry in ipairs(Cfg.FILTER_TABS) do
+		table.insert(newFilters, entry)
+		newMeta[entry.key] = entry
+	end
+	local function registerExtra(rawName)
+		if type(rawName) ~= "string" or rawName == "" then return end
+		local lower = string.lower(rawName)
+		if lower == "normal" or lower == "base" or lower == "golden" or lower == "rainbow" or lower == "shiny" then return end
+		local key = "extra:" .. lower
+		if not addedExtra[key] then
+			addedExtra[key] = true
+			local entry = { key = key, label = rawName, short = string.upper(string.sub(rawName, 1, 6)), color = Color3.fromRGB(196, 86, 138) }
+			table.insert(newFilters, entry)
+			newMeta[key] = entry
+		end
+	end
+	if S.cachedDirMutations == nil then
+		S.cachedDirMutations = {}
+		local rawDirRoot = ReplicatedStorage:FindFirstChild("__DIRECTORY")
+		if rawDirRoot then
+			for _, fName in ipairs({ "Mutations", "PetMutations" }) do
+				local mf = rawDirRoot:FindFirstChild(fName)
+				if mf then
+					for _, child in ipairs(mf:GetDescendants()) do
+						if child:IsA("ModuleScript") then
+							table.insert(S.cachedDirMutations, string.match(child.Name, "^%d+%s*|%s*(.+)$") or child.Name)
+						end
+					end
+				end
+			end
+		end
+	end
+	for _, m in ipairs(S.cachedDirMutations) do registerExtra(m) end
+	for _, m in ipairs(discoveredExtras) do registerExtra(m) end
+
+	local sigParts = {}
+	for i = 1, #newFilters do sigParts[i] = newFilters[i].key end
+	local sig = table.concat(sigParts, "|")
+	local changed = (sig ~= S.lastMutationSignature)
+	S.lastMutationSignature = sig
+	S.activeFilters, S.filterMetaByKey = newFilters, newMeta
+	if not S.filterMetaByKey[S.selectedMutFilter] then S.selectedMutFilter = "all" end
+	return changed
+end
+
+function F.addStatBucket(petMap, mutKey, am, isLocked, eqInStack)
+	local st = petMap[mutKey]
+	if not st then
+		st = { sendable = 0, equipped = 0, locked = 0, total = 0 }
+		petMap[mutKey] = st
+	end
+	st.total = st.total + am
+	if isLocked then
+		st.locked = st.locked + am
+	else
+		st.equipped = st.equipped + eqInStack
+		st.sendable = st.sendable + (S.skipEquipped and math.max(0, am - eqInStack) or am)
+	end
+end
+
+function F.ensurePetRecord(petId)
+	local lowerId = string.lower(petId)
+	local existing = S.petByLowerId[lowerId]
+	local dir = type(S.PetDirectory) == "table" and rawget(S.PetDirectory, petId) or nil
+	if existing then
+		if type(dir) == "table" then
+			if existing.thumbnail == "" then
+				local rawName = rawget(dir, "name")
+				if type(rawName) == "string" and rawName ~= "" then
+					existing.displayName, existing.lowerName = rawName, string.lower(rawName)
+					existing.searchBlob = string.lower(rawName .. " " .. existing.petId)
+				end
+				local thumb = F.normalizeAssetId(rawget(dir, "thumbnail"))
+				local goldThumb = F.normalizeAssetId(rawget(dir, "goldenThumbnail"))
+				existing.thumbnail = (thumb ~= "" and thumb) or goldThumb
+				existing.goldenThumbnail = (goldThumb ~= "" and goldThumb) or existing.thumbnail
+				local pv = rawget(dir, "power")
+				if F.isValidFiniteNumber(pv) then existing.power = pv end
+			end
+			if rawget(dir, "huge") == true then existing.isHuge, existing.isHugeOrTitanic = true, true end
+			if rawget(dir, "titanic") == true or rawget(dir, "gargantuan") == true then existing.isHugeOrTitanic = true end
+		end
+		return existing
+	end
+
+	local displayName, thumb, goldThumb, power = petId, "", "", 0
+	local isHuge = (string.sub(petId, 1, 5) == "Huge ")
+	local isHugeOrTitanic = isHuge or (string.sub(petId, 1, 8) == "Titanic ") or (string.sub(petId, 1, 11) == "Gargantuan ")
+	if type(dir) == "table" then
+		local rawName = rawget(dir, "name")
+		if type(rawName) == "string" and rawName ~= "" then displayName = rawName end
+		thumb = F.normalizeAssetId(rawget(dir, "thumbnail"))
+		goldThumb = F.normalizeAssetId(rawget(dir, "goldenThumbnail"))
+		if thumb == "" then thumb = goldThumb end
+		if goldThumb == "" then goldThumb = thumb end
+		local pv = rawget(dir, "power")
+		if F.isValidFiniteNumber(pv) then power = pv end
+		if rawget(dir, "huge") == true then isHuge, isHugeOrTitanic = true, true end
+		if rawget(dir, "titanic") == true or rawget(dir, "gargantuan") == true then isHugeOrTitanic = true end
+	end
+	local meta = S.dirOrderMap[lowerId] or S.dirOrderMap[string.lower(displayName)]
+	local rec = {
+		petId = petId, lowerId = lowerId, displayName = displayName, lowerName = string.lower(displayName),
+		searchBlob = string.lower(displayName .. " " .. petId), thumbnail = thumb, goldenThumbnail = goldThumb,
+		power = power, zoneNum = meta and meta.zoneNum or 0, dirOrder = meta and meta.order or 0,
+		isHuge = isHuge, isHugeOrTitanic = isHugeOrTitanic,
+	}
+	S.petByLowerId[lowerId] = rec
+	table.insert(S.allPets, rec)
+	return rec
+end
+
+function F.sortPetsList(list)
+	table.sort(list, function(a, b)
+		if a.zoneNum ~= b.zoneNum then return a.zoneNum > b.zoneNum end
+		if a.power ~= b.power then return a.power > b.power end
+		if a.dirOrder ~= b.dirOrder then return a.dirOrder > b.dirOrder end
+		return a.lowerName < b.lowerName
+	end)
+end
+
+function F.refreshInventoryCounts(forceGc, progressCb, fastMode)
+	S.statsByPetAndMut, S.ownedPetsList = {}, {}
+	local discoveredExtras = {}
+	local save, source = F.resolveLiveSave(forceGc, progressCb)
+	local inv = save and rawget(save, "Inventory")
+	local invPets = type(inv) == "table" and rawget(inv, "Pet") or nil
+	if type(invPets) ~= "table" then
+		if not fastMode then F.rebuildMutationRegistry(discoveredExtras) end
+		return false, 0, 0, source, false
+	end
+
+	local eqCounts = F.getEquippedCountByUid(save)
+	local totalSendableAll, uniqueVariantsCount, countedVariantKeys, ownedSeenLower = 0, 0, {}, {}
+	for uid, item in pairs(invPets) do
+		if type(uid) == "string" and type(item) == "table" then
+			local id = rawget(item, "id")
+			if type(id) == "string" and id ~= "" then
+				local lowerId = string.lower(id)
+				local am = F.getItemAmount(item)
+				local locked = F.isItemLocked(item)
+				local eqInStack = math.min(am, eqCounts[uid] or (F.isItemMarkedEquipped(item) and 1 or 0))
+				local primaryKey, _, extras = F.getItemMutationInfo(item)
+
+				local petMap = S.statsByPetAndMut[lowerId]
+				if not petMap then petMap = {}; S.statsByPetAndMut[lowerId] = petMap end
+				if not ownedSeenLower[lowerId] then
+					ownedSeenLower[lowerId] = true
+					table.insert(S.ownedPetsList, F.ensurePetRecord(id))
+				end
+				F.addStatBucket(petMap, primaryKey, am, locked, eqInStack)
+				for _, exName in ipairs(extras) do
+					table.insert(discoveredExtras, exName)
+					local exKey = "extra:" .. string.lower(exName)
+					if exKey ~= primaryKey then F.addStatBucket(petMap, exKey, am, locked, eqInStack) end
+				end
+				local pairKey = lowerId .. "\0" .. primaryKey
+				if not countedVariantKeys[pairKey] then
+					countedVariantKeys[pairKey] = true
+					uniqueVariantsCount = uniqueVariantsCount + 1
+				end
+				if not locked then
+					totalSendableAll = totalSendableAll + (S.skipEquipped and math.max(0, am - eqInStack) or am)
+				end
+			end
+		end
+	end
+	F.sortPetsList(S.ownedPetsList)
+	local mutChanged = (not fastMode or #discoveredExtras > 0) and F.rebuildMutationRegistry(discoveredExtras) or false
+	return true, totalSendableAll, uniqueVariantsCount, source, mutChanged
+end
+
+function F.buildFullCatalogOnce(onDone)
+	if S.catalogBuilt then
+		if onDone then onDone() end
+		return
+	end
+	S.catalogBuilt = true
+	if type(S.PetDirectory) == "table" then
+		local n = 0
+		for petId, dir in pairs(S.PetDirectory) do
+			if S.isDestroyed then return end
+			if type(petId) == "string" and type(dir) == "table" then F.ensurePetRecord(petId) end
+			n = n + 1
+			if n % 800 == 0 then task.wait() end
+		end
+		F.sortPetsList(S.allPets)
+		if onDone and not S.isDestroyed then onDone() end
+	end
+	if not S.dirOrderReady then
+		S.dirOrderReady = true
+		local rawDirRoot = ReplicatedStorage:FindFirstChild("__DIRECTORY")
+		local rawPetsDir = rawDirRoot and rawDirRoot:FindFirstChild("Pets")
+		if rawPetsDir then
+			local desc, seq = rawPetsDir:GetDescendants(), 0
+			for i = 1, #desc do
+				if S.isDestroyed then return end
+				local obj = desc[i]
+				if obj:IsA("ModuleScript") then
+					seq = seq + 1
+					local rawName = obj.Name
+					local cleanId = string.match(rawName, "^%d+%s*|%s*(.+)$") or rawName
+					local zoneNum = tonumber(string.match(rawName, "^(%d+)")) or 0
+					local parent = obj.Parent
+					while parent and parent ~= rawPetsDir do
+						local pNum = tonumber(string.match(parent.Name, "^(%d+)"))
+						if pNum and pNum > zoneNum then zoneNum = pNum end
+						parent = parent.Parent
+					end
+					local meta = { order = seq, zoneNum = zoneNum }
+					local lowerClean = string.lower(cleanId)
+					S.dirOrderMap[lowerClean], S.dirOrderMap[string.lower(rawName)] = meta, meta
+					local rec = S.petByLowerId[lowerClean]
+					if rec then rec.zoneNum, rec.dirOrder = zoneNum, seq end
+				end
+				if i % 600 == 0 then task.wait() end
+			end
+			F.sortPetsList(S.allPets)
+			F.sortPetsList(S.ownedPetsList)
+			if onDone and not S.isDestroyed then onDone() end
+		end
+	end
+end
+
+function F.getIconForMutation(pet, mutKey)
+	if not pet then return "" end
+	if mutKey == "golden" or mutKey == "shiny_golden" then
+		return pet.goldenThumbnail ~= "" and pet.goldenThumbnail or pet.thumbnail
+	end
+	return pet.thumbnail
+end
+
+function F.getMutationMeta(mutKey)
+	return S.filterMetaByKey[mutKey] or Cfg.FILTER_TABS[3]
+end
+
+function F.parseMultiRecipients(rawText)
+	local text = rawText or ""
+	if text == S.lastRecipRaw then return S.cachedRecipients, S.cachedInvalidCount end
+	local valid, invalidCount, seen, selfLower = {}, 0, {}, string.lower(LocalPlayer.Name)
+	for segment in string.gmatch(text, "([^|\r\n,;]+)") do
+		local name = F.trimString(segment)
+		if name ~= "" then
+			local lower = string.lower(name)
+			if lower ~= selfLower then
+				if #name >= 3 and #name <= 20 and string.match(name, "^[A-Za-z0-9_]+$") then
+					if not seen[lower] then seen[lower] = true; table.insert(valid, name) end
+				else
+					invalidCount = invalidCount + 1
+				end
+			end
+		end
+	end
+	S.lastRecipRaw, S.cachedRecipients, S.cachedInvalidCount = text, valid, invalidCount
+	return valid, invalidCount
+end
+
+function F.parseSingleRecipient(rawText)
+	local name = F.trimString(rawText or "")
+	local first = string.match(name, "([A-Za-z0-9_]+)") or ""
+	if first == "" or #first < 3 or #first > 20 then return nil, "invalid" end
+	if string.lower(first) == string.lower(LocalPlayer.Name) then return nil, "self" end
+	return first, nil
+end
+
+function F.findMailboxRemote()
+	if S.cachedMailboxRemote and S.cachedMailboxRemote.Parent then return S.cachedMailboxRemote end
+	S.cachedMailboxRemote = nil
+	local netFolder = ReplicatedStorage:FindFirstChild("Network")
+	if netFolder then
+		local relay = netFolder:FindFirstChild("EF_Relay")
+		if relay and relay:IsA("RemoteFunction") then S.cachedMailboxRemote = relay; return relay end
+		local exact = netFolder:FindFirstChild("Mailbox: Send")
+		if exact and exact:IsA("RemoteFunction") then S.cachedMailboxRemote = exact; return exact end
+		for _, child in ipairs(netFolder:GetChildren()) do
+			if child:IsA("RemoteFunction") then
+				local ln = string.lower(child.Name)
+				if string.find(ln, "mailbox", 1, true) and string.find(ln, "send", 1, true) then
+					S.cachedMailboxRemote = child; return child
+				end
+			end
+		end
+	end
+	return nil
+end
+
+function F.invokeMailboxSend(recipient, message, uid, amount)
+	local amt = math.max(1, math.floor(amount))
+	local remote = F.findMailboxRemote()
+	if remote then
+		local callOk, resOk, timedOut, errMsg = F.callWithTimeout(remote.InvokeServer, Cfg.INVOKE_TIMEOUT, true, remote, recipient, message, "Pet", uid, amt)
+		if timedOut then return false, "Server timeout (" .. tostring(Cfg.INVOKE_TIMEOUT) .. "s)", "Remote:" .. remote.Name end
+		if callOk then
+			if resOk == true then return true, nil, "Remote:" .. remote.Name end
+			return false, tostring(errMsg or ("Server returned: " .. tostring(resOk))), "Remote:" .. remote.Name
+		end
+		return false, "InvokeServer error: " .. tostring(resOk), "Remote:" .. remote.Name
+	end
+	local netTable = (type(S.NetworkMod) == "table" and type(rawget(S.NetworkMod, "Invoke")) == "function" and S.NetworkMod)
+		or (type(S.cachedGcNetwork) == "table" and type(rawget(S.cachedGcNetwork, "Invoke")) == "function" and S.cachedGcNetwork)
+		or nil
+	if netTable then
+		local callOk, resOk, timedOut, errMsg = F.callWithTimeout(netTable.Invoke, Cfg.INVOKE_TIMEOUT, true, "EF_Relay", recipient, message, "Pet", uid, amt)
+		if timedOut then return false, "Network.Invoke timeout (" .. tostring(Cfg.INVOKE_TIMEOUT) .. "s)", "Network.Invoke" end
+		if callOk then
+			if resOk == true then return true, nil, "Network.Invoke" end
+			return false, tostring(errMsg or ("Server returned: " .. tostring(resOk))), "Network.Invoke"
+		end
+		return false, "Network.Invoke error: " .. tostring(resOk), "Network.Invoke"
+	end
+	return false, "Remote 'EF_Relay' / 'Mailbox: Send' not found", "None"
+end
+
+function F.pickBestLiveStack(targetLowerId, targetMutKey, remainingNeeded, maxRemainingByUid)
+	local save = S.cachedSaveTable or F.resolveLiveSave(false)
+	local inv = save and rawget(save, "Inventory")
+	local invPets = type(inv) == "table" and rawget(inv, "Pet") or nil
+	if type(invPets) ~= "table" then return nil, false end
+	local eqCounts = F.getEquippedCountByUid(save)
+	local bestCandidate = nil
+	for uid, item in pairs(invPets) do
+		if type(uid) == "string" and type(item) == "table" then
+			local id = rawget(item, "id")
+			if type(id) == "string" and string.lower(id) == targetLowerId and not F.isItemLocked(item) and F.itemMatchesExactMutation(item, targetMutKey) then
+				local liveAm = F.getItemAmount(item)
+				local cappedAm = maxRemainingByUid[uid] and math.min(liveAm, maxRemainingByUid[uid]) or liveAm
+				local eqInStack = S.skipEquipped and math.min(cappedAm, eqCounts[uid] or (F.isItemMarkedEquipped(item) and 1 or 0)) or 0
+				local avail = math.max(0, cappedAm - eqInStack)
+				if avail > 0 then
+					local fitRank = (avail == remainingNeeded and 1) or (avail > remainingNeeded and 2) or 3
+					local cand = { uid = uid, avail = avail, cappedAm = cappedAm, fitRank = fitRank }
+					if not bestCandidate or (cand.fitRank < bestCandidate.fitRank) or (cand.fitRank == bestCandidate.fitRank and ((cand.fitRank == 2 and cand.avail < bestCandidate.avail) or (cand.fitRank == 3 and cand.avail > bestCandidate.avail))) then
+						bestCandidate = cand
+					end
+				end
+			end
+		end
+	end
+	return bestCandidate, true
+end
+
+function F.collectBatchCandidateUids(targetLowerId, targetMutKey)
+	local save = S.cachedSaveTable or F.resolveLiveSave(false)
+	local inv = save and rawget(save, "Inventory")
+	local invPets = type(inv) == "table" and rawget(inv, "Pet") or nil
+	if type(invPets) ~= "table" then return {}, false end
+	local eqCounts = F.getEquippedCountByUid(save)
+	local uids = {}
+	for uid, item in pairs(invPets) do
+		if type(uid) == "string" and type(item) == "table" then
+			local id = rawget(item, "id")
+			if type(id) == "string" and string.lower(id) == targetLowerId and not F.isItemLocked(item) and F.itemMatchesExactMutation(item, targetMutKey) then
+				local liveAm = F.getItemAmount(item)
+				local eqInStack = S.skipEquipped and math.min(liveAm, eqCounts[uid] or (F.isItemMarkedEquipped(item) and 1 or 0)) or 0
+				if liveAm - eqInStack > 0 then table.insert(uids, { uid = uid, eq = eqInStack }) end
+			end
+		end
+	end
+	return uids, true
+end
+
+function F.pickFastBatchStack(batchList, targetLowerId, targetMutKey, remainingNeeded, maxRemainingByUid)
+	local save = S.cachedSaveTable
+	local inv = save and rawget(save, "Inventory")
+	local invPets = type(inv) == "table" and rawget(inv, "Pet") or nil
+	if type(invPets) ~= "table" then return nil, false end
+	local bestCandidate = nil
+	for i = #batchList, 1, -1 do
+		local entry = batchList[i]
+		local item = rawget(invPets, entry.uid)
+		if type(item) ~= "table" or F.isItemLocked(item) then
+			table.remove(batchList, i)
+		else
+			local liveAm = F.getItemAmount(item)
+			local cappedAm = maxRemainingByUid[entry.uid] and math.min(liveAm, maxRemainingByUid[entry.uid]) or liveAm
+			local eqInStack = S.skipEquipped and math.min(cappedAm, entry.eq) or 0
+			local avail = math.max(0, cappedAm - eqInStack)
+			if avail <= 0 then
+				table.remove(batchList, i)
+			else
+				local fitRank = (avail == remainingNeeded and 1) or (avail > remainingNeeded and 2) or 3
+				local cand = { uid = entry.uid, avail = avail, cappedAm = cappedAm, fitRank = fitRank }
+				if not bestCandidate or (cand.fitRank < bestCandidate.fitRank) or (cand.fitRank == bestCandidate.fitRank and ((cand.fitRank == 2 and cand.avail < bestCandidate.avail) or (cand.fitRank == 3 and cand.avail > bestCandidate.avail))) then
+					bestCandidate = cand
+				end
+				if bestCandidate.fitRank == 1 then break end
+			end
+		end
+	end
+	if bestCandidate then return bestCandidate, true end
+	return F.pickBestLiveStack(targetLowerId, targetMutKey, remainingNeeded, maxRemainingByUid)
+end
+
+-- Compact Scoped UI Builder
+F.loadSentLogFromFile()
+
+do
+	local function mk(cls, parent, props, radius, strokeColor, pad)
+		local inst = Instance.new(cls)
+		if props then
+			for k, v in pairs(props) do inst[k] = v end
+		end
+		inst.Parent = parent
+		if radius then
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0, radius)
+			c.Parent = inst
+		end
+		local st = nil
+		if strokeColor then
+			st = Instance.new("UIStroke")
+			st.Color = strokeColor
+			st.Thickness = 1
+			st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+			st.Parent = inst
+		end
+		if pad then
+			local p = Instance.new("UIPadding")
+			p.PaddingTop, p.PaddingBottom, p.PaddingLeft, p.PaddingRight = UDim.new(0, pad[1]), UDim.new(0, pad[2]), UDim.new(0, pad[3]), UDim.new(0, pad[4])
+			p.Parent = inst
+		end
+		return inst, st
+	end
+
+	local function wireFocus(box, stroke, idle)
+		F.trackConn(box.Focused:Connect(function() F.tweenProp(stroke, { Color = Color3.fromRGB(64, 178, 130) }, 0.14) end))
+		F.trackConn(box.FocusLost:Connect(function() F.tweenProp(stroke, { Color = idle }, 0.18) end))
+	end
+
+	local function wireHover(btn, getBase)
+		F.trackConn(btn.MouseEnter:Connect(function()
+			local b = getBase()
+			F.tweenProp(btn, { BackgroundColor3 = Color3.new(math.min(1, b.R + 0.06), math.min(1, b.G + 0.06), math.min(1, b.B + 0.06)) }, 0.12)
+		end))
+		F.trackConn(btn.MouseLeave:Connect(function() F.tweenProp(btn, { BackgroundColor3 = getBase() }, 0.14) end))
+	end
+
+	local guiParent = LocalPlayer:WaitForChild("PlayerGui")
+	if type(gethui) == "function" then
+		local ok, u = pcall(gethui)
+		if ok and u then guiParent = u end
+	else
+		local okC, cg = pcall(function() return game:GetService("CoreGui") end)
+		if okC and cg then guiParent = cg end
+	end
+	local oldGui = guiParent:FindFirstChild("PS99_AutoMailbox_UI")
+	if oldGui then oldGui:Destroy() end
+
+	UI.ScreenGui = mk("ScreenGui", guiParent, { Name = "PS99_AutoMailbox_UI", ResetOnSpawn = false, DisplayOrder = 999999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
+	local vp = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1280, 720)
+	UI.winWidth, UI.winHeight, UI.headerHeight = math.min(436, math.max(330, vp.X - 24)), math.min(620, math.max(380, vp.Y - 24)), 40
+
+	UI.MainFrame = mk("Frame", UI.ScreenGui, {
+		Name = "MainFrame", Size = UDim2.fromOffset(UI.winWidth, UI.winHeight),
+		Position = UDim2.fromOffset(math.floor((vp.X - UI.winWidth) * 0.5), math.floor((vp.Y - UI.winHeight) * 0.5)),
+		BackgroundColor3 = Color3.fromRGB(16, 20, 29), BorderSizePixel = 0, Active = true, ClipsDescendants = true,
+	}, 12, Color3.fromRGB(46, 58, 78))
+
+	UI.Header = mk("TextButton", UI.MainFrame, { Name = "Header", Size = UDim2.new(1, 0, 0, UI.headerHeight), BackgroundColor3 = Color3.fromRGB(22, 28, 40), BorderSizePixel = 0, Text = "", AutoButtonColor = false, Active = true, ZIndex = 2 })
+	mk("Frame", UI.Header, { Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = Color3.fromRGB(40, 50, 68), BorderSizePixel = 0, ZIndex = 3 })
+	UI.Title = mk("TextLabel", UI.Header, { Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -242, 1, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "PS99 Auto Mailbox v12", TextColor3 = Color3.fromRGB(240, 245, 252), TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 3 })
+	UI.AfkBadgeBtn, UI.AfkStroke = mk("TextButton", UI.Header, { Position = UDim2.new(1, -228, 0.5, -11), Size = UDim2.fromOffset(58, 22), BackgroundColor3 = Color3.fromRGB(26, 78, 56), Font = Enum.Font.GothamBold, Text = "AFK: ON", TextColor3 = Color3.fromRGB(145, 240, 185), TextSize = 10, AutoButtonColor = false, ZIndex = 4 }, 6, Color3.fromRGB(48, 140, 96))
+	UI.DiamondLabel = mk("TextLabel", UI.Header, { Position = UDim2.new(1, -164, 0.5, -11), Size = UDim2.fromOffset(100, 22), BackgroundColor3 = Color3.fromRGB(26, 38, 56), Font = Enum.Font.GothamSemibold, Text = "Gems: 0", TextColor3 = Color3.fromRGB(115, 215, 255), TextSize = 11, ZIndex = 3 }, 6)
+	UI.MinBtn = mk("TextButton", UI.Header, { Position = UDim2.new(1, -58, 0.5, -11), Size = UDim2.fromOffset(24, 22), BackgroundColor3 = Color3.fromRGB(42, 52, 70), Font = Enum.Font.GothamBold, Text = "-", TextColor3 = Color3.fromRGB(235, 240, 248), TextSize = 15, ZIndex = 5 }, 6)
+	UI.CloseBtn = mk("TextButton", UI.Header, { Position = UDim2.new(1, -30, 0.5, -11), Size = UDim2.fromOffset(24, 22), BackgroundColor3 = Color3.fromRGB(185, 56, 68), Font = Enum.Font.GothamBold, Text = "X", TextColor3 = Color3.fromRGB(255, 255, 255), TextSize = 11, ZIndex = 5 }, 6)
+
+	UI.Body = mk("ScrollingFrame", UI.MainFrame, { Position = UDim2.fromOffset(0, UI.headerHeight), Size = UDim2.new(1, 0, 1, -UI.headerHeight), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4, ScrollBarImageColor3 = Color3.fromRGB(76, 94, 122), ScrollingDirection = Enum.ScrollingDirection.Y, CanvasSize = UDim2.fromOffset(0, 0) }, nil, nil, { 8, 8, 10, 10 })
+	local bodyLayout = mk("UIListLayout", UI.Body, { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) })
+	F.trackConn(bodyLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		UI.Body.CanvasSize = UDim2.fromOffset(0, bodyLayout.AbsoluteContentSize.Y + 16)
+	end))
+
+	-- 1. Mode Switcher
+	local tabTrack = mk("Frame", UI.Body, { LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.fromRGB(12, 16, 23), BorderSizePixel = 0 }, 8, Color3.fromRGB(38, 48, 66), { 3, 3, 3, 3 })
+	UI.TabSingleBtn = mk("TextButton", tabTrack, { Size = UDim2.new(0.5, -2, 1, 0), BackgroundColor3 = Color3.fromRGB(24, 30, 42), Font = Enum.Font.GothamBold, Text = "Single (1 Acc)", TextColor3 = Color3.fromRGB(170, 184, 208), TextSize = 11, AutoButtonColor = false }, 6)
+	UI.TabMultiBtn = mk("TextButton", tabTrack, { Position = UDim2.new(0.5, 2, 0, 0), Size = UDim2.new(0.5, -2, 1, 0), BackgroundColor3 = Color3.fromRGB(36, 134, 92), Font = Enum.Font.GothamBold, Text = "Multi (Bulk)", TextColor3 = Color3.fromRGB(255, 255, 255), TextSize = 11, AutoButtonColor = false }, 6)
+
+	-- 2A. Single Panel
+	UI.SinglePanel = mk("Frame", UI.Body, { LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 54), BackgroundColor3 = Color3.fromRGB(20, 26, 37), BorderSizePixel = 0, Visible = false }, 8, Color3.fromRGB(38, 48, 66), { 5, 6, 8, 8 })
+	mk("TextLabel", UI.SinglePanel, { Size = UDim2.new(0.68, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamSemibold, Text = "Recipient (1 Acc • Auto Keep)", TextColor3 = Color3.fromRGB(195, 210, 230), TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left })
+	UI.SingleBadge = mk("TextLabel", UI.SinglePanel, { Position = UDim2.new(0.68, 0, 0, 0), Size = UDim2.new(0.32, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "Empty", TextColor3 = Color3.fromRGB(145, 160, 185), TextSize = 10, TextXAlignment = Enum.TextXAlignment.Right })
+	local sBox, sStroke = mk("TextBox", UI.SinglePanel, { Position = UDim2.fromOffset(0, 17), Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = Color3.fromRGB(12, 16, 23), Font = Enum.Font.GothamSemibold, PlaceholderText = "Paste or type 1 username only...", PlaceholderColor3 = Color3.fromRGB(96, 110, 132), Text = "", TextColor3 = Color3.fromRGB(240, 246, 255), TextSize = 12, MultiLine = false, TextWrapped = false, ClipsDescendants = true, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left }, 6, Color3.fromRGB(48, 60, 80), { 0, 0, 8, 8 })
+	wireFocus(sBox, sStroke, Color3.fromRGB(48, 60, 80))
+	UI.SingleUserBox = sBox
+
+	-- 2B. Multi Panel
+	UI.MultiPanel = mk("Frame", UI.Body, { LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 92), BackgroundColor3 = Color3.fromRGB(20, 26, 37), BorderSizePixel = 0, Visible = true }, 8, Color3.fromRGB(38, 48, 66), { 5, 5, 8, 8 })
+	mk("TextLabel", UI.MultiPanel, { Size = UDim2.fromOffset(80, 16), BackgroundTransparency = 1, Font = Enum.Font.GothamSemibold, Text = "List (| / line)", TextColor3 = Color3.fromRGB(195, 210, 230), TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left })
+	UI.CheckMailLogBtn = mk("TextButton", UI.MultiPanel, { Position = UDim2.fromOffset(84, 0), Size = UDim2.fromOffset(48, 16), BackgroundColor3 = Color3.fromRGB(46, 78, 126), Font = Enum.Font.GothamBold, Text = "Last 20", TextColor3 = Color3.fromRGB(235, 245, 255), TextSize = 9 }, 4)
+	UI.FilterUnsentBtn = mk("TextButton", UI.MultiPanel, { Position = UDim2.fromOffset(136, 0), Size = UDim2.fromOffset(72, 16), BackgroundColor3 = Color3.fromRGB(186, 94, 42), Font = Enum.Font.GothamBold, Text = "Filter unsent", TextColor3 = Color3.fromRGB(255, 255, 255), TextSize = 9, Visible = false }, 4)
+	UI.ClearLogBtn = mk("TextButton", UI.MultiPanel, { Position = UDim2.fromOffset(212, 0), Size = UDim2.fromOffset(58, 16), BackgroundColor3 = Color3.fromRGB(82, 48, 56), Font = Enum.Font.GothamBold, Text = "Clear log", TextColor3 = Color3.fromRGB(245, 200, 205), TextSize = 9, Visible = false }, 4)
+	UI.MultiBadge = mk("TextLabel", UI.MultiPanel, { Position = UDim2.fromOffset(272, 0), Size = UDim2.new(1, -272, 0, 16), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "0 accs", TextColor3 = Color3.fromRGB(145, 160, 185), TextSize = 10, TextXAlignment = Enum.TextXAlignment.Right })
+	local mBox, mStroke = mk("TextBox", UI.MultiPanel, { Position = UDim2.fromOffset(0, 19), Size = UDim2.new(1, 0, 0, 44), BackgroundColor3 = Color3.fromRGB(12, 16, 23), Font = Enum.Font.Gotham, PlaceholderText = "Paste 100-1600+ accs: user1 | user2 or 1 acc per line", PlaceholderColor3 = Color3.fromRGB(96, 110, 132), Text = "", TextColor3 = Color3.fromRGB(240, 245, 255), TextSize = 11, MultiLine = true, TextWrapped = true, ClipsDescendants = true, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, 6, Color3.fromRGB(48, 60, 80), { 4, 4, 8, 8 })
+	wireFocus(mBox, mStroke, Color3.fromRGB(48, 60, 80))
+	UI.MultiRecipBox = mBox
+	UI.MultiCounterLabel = mk("TextLabel", UI.MultiPanel, { Position = UDim2.fromOffset(0, 66), Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Font = Enum.Font.GothamSemibold, Text = "Total: 0 | Left: 0 | Sent: 0 | Fail: 0", TextColor3 = Color3.fromRGB(145, 175, 205), TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left })
+
+	-- 3. Qty + Delay + Equipped + Optional To MB
+	local qtyWrap = mk("Frame", UI.Body, { LayoutOrder = 3, Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1 })
+	mk("TextLabel", qtyWrap, { Size = UDim2.fromOffset(24, 28), BackgroundTransparency = 1, Font = Enum.Font.GothamSemibold, Text = "Qty:", TextColor3 = Color3.fromRGB(205, 215, 232), TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left })
+	local qBox, qStroke = mk("TextBox", qtyWrap, { Position = UDim2.fromOffset(26, 0), Size = UDim2.fromOffset(46, 28), BackgroundColor3 = Color3.fromRGB(12, 16, 23), Font = Enum.Font.GothamBold, PlaceholderText = "1", Text = "1", TextColor3 = Color3.fromRGB(255, 255, 255), TextSize = 12, ClearTextOnFocus = false }, 6, Color3.fromRGB(48, 60, 80))
+	wireFocus(qBox, qStroke, Color3.fromRGB(48, 60, 80))
+	UI.QtyBox = qBox
+	mk("TextLabel", qtyWrap, { Position = UDim2.fromOffset(78, 0), Size = UDim2.fromOffset(32, 28), BackgroundTransparency = 1, Font = Enum.Font.GothamSemibold, Text = "Wait:", TextColor3 = Color3.fromRGB(205, 215, 232), TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left })
+	local dBox, dStroke = mk("TextBox", qtyWrap, { Position = UDim2.fromOffset(112, 0), Size = UDim2.fromOffset(40, 28), BackgroundColor3 = Color3.fromRGB(12, 16, 23), Font = Enum.Font.GothamBold, PlaceholderText = "0", Text = tostring(Cfg.DEFAULT_SEND_DELAY), TextColor3 = Color3.fromRGB(255, 255, 255), TextSize = 11, ClearTextOnFocus = false }, 6, Color3.fromRGB(48, 60, 80))
+	wireFocus(dBox, dStroke, Color3.fromRGB(48, 60, 80))
+	UI.DelayBox = dBox
+	UI.TeamToggleBtn = mk("TextButton", qtyWrap, { Position = UDim2.fromOffset(158, 0), Size = UDim2.new(1, -224, 1, 0), BackgroundColor3 = Color3.fromRGB(42, 56, 78), Font = Enum.Font.GothamSemibold, Text = "Eq: Skip", TextColor3 = Color3.fromRGB(228, 236, 248), TextSize = 10, AutoButtonColor = false }, 6)
+	UI.GoMailboxBtn = mk("TextButton", qtyWrap, { Position = UDim2.new(1, -60, 0, 0), Size = UDim2.fromOffset(60, 28), BackgroundColor3 = Color3.fromRGB(36, 52, 78), Font = Enum.Font.GothamSemibold, Text = "To MB", TextColor3 = Color3.fromRGB(190, 215, 245), TextSize = 10, AutoButtonColor = false }, 6)
+
+	-- 4. Filter Bar
+	local mutWrap = mk("Frame", UI.Body, { LayoutOrder = 4, Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 })
+	UI.MutScroll = mk("ScrollingFrame", mutWrap, { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(12, 16, 23), BorderSizePixel = 0, ScrollBarThickness = 2, ScrollBarImageColor3 = Color3.fromRGB(76, 94, 122), ScrollingDirection = Enum.ScrollingDirection.X, CanvasSize = UDim2.fromOffset(0, 0) }, 7, Color3.fromRGB(38, 48, 66), { 3, 3, 4, 4 })
+	local mutLayout = mk("UIListLayout", UI.MutScroll, { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) })
+	F.trackConn(mutLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		UI.MutScroll.CanvasSize = UDim2.fromOffset(mutLayout.AbsoluteContentSize.X + 8, 0)
+	end))
+
+	-- 5. Search + Scan
+	local searchWrap = mk("Frame", UI.Body, { LayoutOrder = 5, Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 })
+	local srchBox, srchStroke = mk("TextBox", searchWrap, { Size = UDim2.new(1, -62, 1, 0), BackgroundColor3 = Color3.fromRGB(12, 16, 23), Font = Enum.Font.Gotham, PlaceholderText = "Search pet (e.g. maple, huge, fox...)", PlaceholderColor3 = Color3.fromRGB(96, 110, 132), Text = "", TextColor3 = Color3.fromRGB(240, 245, 255), TextSize = 12, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left }, 7, Color3.fromRGB(48, 60, 80), { 0, 0, 9, 8 })
+	wireFocus(srchBox, srchStroke, Color3.fromRGB(48, 60, 80))
+	UI.SearchBox = srchBox
+	UI.RefreshBtn = mk("TextButton", searchWrap, { Position = UDim2.new(1, -56, 0, 0), Size = UDim2.fromOffset(56, 30), BackgroundColor3 = Color3.fromRGB(38, 102, 168), Font = Enum.Font.GothamBold, Text = "Scan", TextColor3 = Color3.fromRGB(255, 255, 255), TextSize = 11, AutoButtonColor = false }, 7)
+	wireHover(UI.RefreshBtn, function() return Color3.fromRGB(38, 102, 168) end)
+
+	-- 6. Result Slots
+	UI.ResultScroll = mk("ScrollingFrame", UI.Body, { LayoutOrder = 6, Size = UDim2.new(1, 0, 0, 180), BackgroundColor3 = Color3.fromRGB(12, 16, 23), BorderSizePixel = 0, ScrollBarThickness = 4, ScrollBarImageColor3 = Color3.fromRGB(76, 94, 122), ScrollingDirection = Enum.ScrollingDirection.Y, CanvasSize = UDim2.fromOffset(0, 0) }, 8, Color3.fromRGB(38, 48, 66), { 4, 4, 4, 6 })
+	local resLayout = mk("UIListLayout", UI.ResultScroll, { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) })
+	F.trackConn(resLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		UI.ResultScroll.CanvasSize = UDim2.fromOffset(0, resLayout.AbsoluteContentSize.Y + 8)
+	end))
+
+	for i = 1, Cfg.MAX_RESULTS do
+		local row, stroke = mk("TextButton", UI.ResultScroll, { Name = "Slot_" .. tostring(i), LayoutOrder = i, Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = Color3.fromRGB(20, 26, 37), BorderSizePixel = 0, Text = "", AutoButtonColor = false, Visible = false }, 6, Color3.fromRGB(34, 44, 60))
+		local icon = mk("ImageLabel", row, { Position = UDim2.fromOffset(5, 3), Size = UDim2.fromOffset(32, 32), BackgroundColor3 = Color3.fromRGB(14, 18, 26), BorderSizePixel = 0, ScaleType = Enum.ScaleType.Fit, Image = "" }, 5)
+		local mutBadge = mk("TextLabel", row, { Position = UDim2.fromOffset(42, 9), Size = UDim2.fromOffset(46, 20), BackgroundColor3 = Color3.fromRGB(82, 96, 118), Font = Enum.Font.GothamBold, Text = "BASE", TextColor3 = Color3.fromRGB(255, 255, 255), TextSize = 9 }, 4)
+		local nameLbl = mk("TextLabel", row, { Position = UDim2.fromOffset(93, 0), Size = UDim2.new(1, -186, 1, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamSemibold, Text = "", TextColor3 = Color3.fromRGB(236, 242, 250), TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd })
+		local countLbl = mk("TextLabel", row, { Position = UDim2.new(1, -90, 0, 0), Size = UDim2.fromOffset(84, 38), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "", TextColor3 = Color3.fromRGB(130, 225, 175), TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right })
+		local slot = { Button = row, Stroke = stroke, Icon = icon, MutBadge = mutBadge, NameLabel = nameLbl, CountLabel = countLbl, entryRef = nil, Visible = false, IsSelected = false }
+		S.resultSlots[i] = slot
+
+		F.trackConn(row.MouseEnter:Connect(function()
+			if slot.Visible and not slot.IsSelected then F.tweenProp(row, { BackgroundColor3 = Color3.fromRGB(27, 35, 50) }, 0.1) end
+		end))
+		F.trackConn(row.MouseLeave:Connect(function()
+			if slot.Visible and not slot.IsSelected then F.tweenProp(row, { BackgroundColor3 = Color3.fromRGB(20, 26, 37) }, 0.12) end
+		end))
+		F.trackConn(row.MouseButton1Click:Connect(function()
+			if S.isSending or not slot.entryRef then return end
+			S.selectedEntry = slot.entryRef
+			F.refreshSlotHighlights()
+			F.updateSelectedPreview()
+			F.setStatus("Selected: [" .. F.getMutationMeta(S.selectedEntry.mutKey).label .. "] " .. S.selectedEntry.pet.displayName, Color3.fromRGB(165, 205, 180))
+		end))
+	end
+
+	-- 7. Selected Preview Card
+	local selCard, selStroke = mk("Frame", UI.Body, { LayoutOrder = 7, Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = Color3.fromRGB(22, 29, 41), BorderSizePixel = 0 }, 8, Color3.fromRGB(46, 58, 78))
+	UI.SelectedStroke = selStroke
+	UI.SelectedIcon = mk("ImageLabel", selCard, { Position = UDim2.fromOffset(6, 6), Size = UDim2.fromOffset(34, 34), BackgroundColor3 = Color3.fromRGB(14, 18, 26), BorderSizePixel = 0, ScaleType = Enum.ScaleType.Fit, Image = "" }, 6)
+	UI.SelectedNameLabel = mk("TextLabel", selCard, { Position = UDim2.fromOffset(48, 5), Size = UDim2.new(1, -56, 0, 18), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "No pet selected", TextColor3 = Color3.fromRGB(238, 244, 252), TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd })
+	UI.SelectedMetaLabel = mk("TextLabel", selCard, { Position = UDim2.fromOffset(48, 24), Size = UDim2.new(1, -56, 0, 16), BackgroundTransparency = 1, Font = Enum.Font.Gotham, Text = "Click a pet from the list above", TextColor3 = Color3.fromRGB(145, 160, 185), TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd })
+
+	-- 8. Action + Progress + Status
+	local actionWrap = mk("Frame", UI.Body, { LayoutOrder = 8, Size = UDim2.new(1, 0, 0, 86), BackgroundTransparency = 1 })
+	UI.SendBtn = mk("TextButton", actionWrap, { Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Color3.fromRGB(38, 166, 107), Font = Enum.Font.GothamBold, Text = "SEND MULTI MAILBOX", TextColor3 = Color3.fromRGB(255, 255, 255), TextSize = 13, AutoButtonColor = false }, 8)
+	wireHover(UI.SendBtn, function() return S.isSending and Color3.fromRGB(194, 58, 70) or Color3.fromRGB(38, 166, 107) end)
+	local progTrack = mk("Frame", actionWrap, { Position = UDim2.fromOffset(0, 38), Size = UDim2.new(1, 0, 0, 5), BackgroundColor3 = Color3.fromRGB(12, 16, 23), BorderSizePixel = 0, ClipsDescendants = true }, 3)
+	UI.ProgressFill = mk("Frame", progTrack, { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(42, 185, 120), BorderSizePixel = 0 }, 3)
+	UI.StatusLabel = mk("TextLabel", actionWrap, { Position = UDim2.fromOffset(0, 47), Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = Color3.fromRGB(12, 16, 23), Font = Enum.Font.GothamSemibold, Text = "Initializing...", TextColor3 = Color3.fromRGB(165, 205, 180), TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center }, 7, Color3.fromRGB(34, 44, 60), { 2, 2, 8, 8 })
+end
+
+-- UI Logic Functions
+function F.setStatus(text, color)
+	if S.isDestroyed then return end
+	UI.StatusLabel.Text = tostring(text)
+	UI.StatusLabel.TextColor3 = color or Color3.fromRGB(165, 205, 180)
+end
+
+function F.setProgress(ratio)
+	if S.isDestroyed then return end
+	F.tweenProp(UI.ProgressFill, { Size = UDim2.new(math.clamp(ratio or 0, 0, 1), 0, 1, 0) }, 0.14)
+end
+
+function F.updateDiamondsUI()
+	if S.isDestroyed then return end
+	UI.DiamondLabel.Text = "Gems: " .. F.formatCompact(F.getDiamonds())
+end
+
+function F.getSanitizedQty()
+	local cleaned = string.gsub(UI.QtyBox.Text or "", "%D", "")
+	local n = tonumber(cleaned)
+	if not n or not F.isValidFiniteNumber(n) or n < 1 then return 0 end
+	return math.floor(n)
+end
+
+function F.getSanitizedDelay()
+	local cleaned = string.gsub(UI.DelayBox.Text or "", ",", ".")
+	local n = tonumber(cleaned)
+	if not n or not F.isValidFiniteNumber(n) then return Cfg.DEFAULT_SEND_DELAY end
+	return math.clamp(n, Cfg.MIN_SEND_DELAY, 30)
+end
+
+function F.getActiveRecipients()
+	if S.sendMode == "single" then
+		local u = F.parseSingleRecipient(UI.SingleUserBox.Text)
+		return u and { u } or {}
+	end
+	return (F.parseMultiRecipients(UI.MultiRecipBox.Text))
+end
+
+function F.updateMultiCounters(total, remaining, doneCount, failCount)
+	if S.isDestroyed then return end
+	UI.MultiCounterLabel.Text = string.format("Total: %s | Left: %s | Sent: %s | Fail: %s", F.formatNumber(total), F.formatNumber(remaining), F.formatNumber(doneCount), F.formatNumber(failCount))
+	UI.MultiCounterLabel.TextColor3 = (remaining > 0 and S.isSending and Color3.fromRGB(125, 215, 255))
+		or (failCount > 0 and Color3.fromRGB(245, 175, 105))
+		or (doneCount > 0 and remaining == 0 and Color3.fromRGB(115, 225, 155))
+		or Color3.fromRGB(145, 175, 205)
+end
+
+function F.refreshUnsentButtons()
+	if S.isDestroyed then return end
+	local recips = F.parseMultiRecipients(UI.MultiRecipBox.Text)
+	local unsent = {}
+	for _, name in ipairs(recips) do
+		if not (S.currentBatchCompletedSet and S.currentBatchCompletedSet[name]) and not S.sentLogSet[string.lower(name)] then
+			table.insert(unsent, name)
+		end
+	end
+	S.lastUnsentRecipients = unsent
+	if #recips > 0 and #unsent < #recips and #unsent > 0 then
+		UI.FilterUnsentBtn.Text = "Unsent " .. tostring(#unsent)
+		UI.FilterUnsentBtn.Visible = true
+	else
+		UI.FilterUnsentBtn.Visible = false
+	end
+	if S.sentLogCount > 0 then
+		UI.ClearLogBtn.Text = "Clear (" .. tostring(S.sentLogCount) .. ")"
+		UI.ClearLogBtn.Visible = true
+	else
+		UI.ClearLogBtn.Visible = false
+	end
+end
+
+function F.updateRecipientBadges()
+	local singleUser, singleErr = F.parseSingleRecipient(UI.SingleUserBox.Text)
+	if S.singleWarnNote then
+		UI.SingleBadge.Text, UI.SingleBadge.TextColor3 = S.singleWarnNote, Color3.fromRGB(245, 185, 95)
+	elseif singleUser then
+		UI.SingleBadge.Text, UI.SingleBadge.TextColor3 = "1 valid acc", Color3.fromRGB(115, 220, 155)
+	elseif singleErr == "self" then
+		UI.SingleBadge.Text, UI.SingleBadge.TextColor3 = "Matches self", Color3.fromRGB(245, 130, 120)
+	elseif F.trimString(UI.SingleUserBox.Text) ~= "" then
+		UI.SingleBadge.Text, UI.SingleBadge.TextColor3 = "3-20 chars", Color3.fromRGB(245, 175, 95)
+	else
+		UI.SingleBadge.Text, UI.SingleBadge.TextColor3 = "Empty", Color3.fromRGB(145, 160, 185)
+	end
+
+	local recipients, invalidCount = F.parseMultiRecipients(UI.MultiRecipBox.Text)
+	if invalidCount > 0 then
+		UI.MultiBadge.Text, UI.MultiBadge.TextColor3 = string.format("%d | %d bad", #recipients, invalidCount), Color3.fromRGB(245, 175, 95)
+	elseif #recipients > 0 then
+		UI.MultiBadge.Text, UI.MultiBadge.TextColor3 = string.format("%d accs", #recipients), Color3.fromRGB(115, 220, 155)
+	else
+		UI.MultiBadge.Text, UI.MultiBadge.TextColor3 = "0 accs", Color3.fromRGB(145, 160, 185)
+	end
+	if not S.isSending then
+		F.updateMultiCounters(#recipients, #recipients, 0, 0)
+		F.refreshUnsentButtons()
+	end
+end
+
+function F.parseCooldownSeconds(errStr, attempt)
+	local lower = string.lower(errStr or "")
+	local totalParsed = nil
+	local mStr, sStr = string.match(lower, "(%d+%.?%d*)%s*m[a-z]*%s*(%d+%.?%d*)%s*s")
+	if mStr and sStr then
+		local mins, secs = tonumber(mStr), tonumber(sStr)
+		if mins and secs then totalParsed = mins * 60 + secs end
+	end
+	if not totalParsed then
+		local minOnly = string.match(lower, "(%d+%.?%d*)%s*min") or string.match(lower, "(%d+%.?%d*)%s*m$") or string.match(lower, "(%d+%.?%d*)%s*m[^a-z]")
+		local mins = tonumber(minOnly)
+		if mins and F.isValidFiniteNumber(mins) and mins > 0 and mins <= 5 then totalParsed = mins * 60 end
+	end
+	if not totalParsed then
+		local secs = tonumber(string.match(lower, "(%d+%.?%d*)%s*s") or string.match(lower, "(%d+%.?%d*)"))
+		if secs and F.isValidFiniteNumber(secs) and secs > 0 and secs <= 180 then totalParsed = secs end
+	end
+	if totalParsed and F.isValidFiniteNumber(totalParsed) and totalParsed > 0 and totalParsed <= 180 then
+		return math.clamp(totalParsed + 0.08, 0.25, 180.5), true
+	end
+	return (attempt <= 6 and 0.35) or (attempt <= 14 and 0.55) or 0.85, false
+end
+
+function F.getPetMutStats(lowerId, mutKey)
+	local petMap = S.statsByPetAndMut[lowerId]
+	local st = petMap and petMap[mutKey]
+	if not st then return 0, 0, 0, 0 end
+	return st.sendable, st.equipped, st.locked, st.total
+end
+
+function F.updateSelectedPreview()
+	if not S.selectedEntry or not S.selectedEntry.pet then
+		UI.SelectedStroke.Color = Color3.fromRGB(46, 58, 78)
+		UI.SelectedIcon.Image = ""
+		UI.SelectedNameLabel.Text = "No pet selected"
+		UI.SelectedMetaLabel.Text, UI.SelectedMetaLabel.TextColor3 = "Click a pet from the list above", Color3.fromRGB(145, 160, 185)
+		return
+	end
+	local pet, mutKey = S.selectedEntry.pet, S.selectedEntry.mutKey
+	local meta = F.getMutationMeta(mutKey)
+	local sendable, eqCount, lockedCount = F.getPetMutStats(pet.lowerId, mutKey)
+	local needed = F.getSanitizedQty() * math.max(1, #F.getActiveRecipients())
+
+	UI.SelectedStroke.Color = meta.color
+	UI.SelectedIcon.Image = F.getIconForMutation(pet, mutKey)
+	UI.SelectedNameLabel.Text = string.format("[%s] %s", meta.label, pet.displayName)
+	local note = (S.skipEquipped and eqCount > 0 and (" (eq:" .. F.formatNumber(eqCount) .. ")")) or (lockedCount > 0 and (" (lock:" .. F.formatNumber(lockedCount) .. ")")) or ""
+
+	if F.getSanitizedQty() <= 0 then
+		UI.SelectedMetaLabel.Text, UI.SelectedMetaLabel.TextColor3 = string.format("Avail: %s%s | Enter Qty >= 1", F.formatNumber(sendable), note), Color3.fromRGB(245, 185, 95)
+	elseif sendable >= needed then
+		UI.SelectedMetaLabel.Text, UI.SelectedMetaLabel.TextColor3 = string.format("Avail: %s%s | Need: %s (OK)", F.formatNumber(sendable), note, F.formatNumber(needed)), Color3.fromRGB(125, 225, 165)
+	else
+		UI.SelectedMetaLabel.Text, UI.SelectedMetaLabel.TextColor3 = string.format("Avail: %s%s | Need: %s (Short %s)", F.formatNumber(sendable), note, F.formatNumber(needed), F.formatNumber(needed - sendable)), Color3.fromRGB(245, 165, 95)
+	end
+end
+
+function F.refreshSlotHighlights()
+	for i = 1, Cfg.MAX_RESULTS do
+		local slot = S.resultSlots[i]
+		if slot.Visible and slot.entryRef then
+			local isSel = S.selectedEntry and S.selectedEntry.pet.lowerId == slot.entryRef.pet.lowerId and S.selectedEntry.mutKey == slot.entryRef.mutKey
+			slot.IsSelected = isSel
+			slot.Button.BackgroundColor3 = isSel and Color3.fromRGB(30, 56, 46) or Color3.fromRGB(20, 26, 37)
+			slot.Stroke.Color = isSel and Color3.fromRGB(64, 185, 125) or Color3.fromRGB(34, 44, 60)
+		end
+	end
+end
+
+function F.collectDistinctRowsForPet(pet, ownedBucket, otherBucket)
+	if S.selectedMutFilter == "huge" and not pet.isHuge then return end
+	local petMap = S.statsByPetAndMut[pet.lowerId]
+	if S.selectedMutFilter ~= "all" and S.selectedMutFilter ~= "huge" then
+		local st = petMap and petMap[S.selectedMutFilter]
+		local entry = { pet = pet, mutKey = S.selectedMutFilter }
+		if st and st.total > 0 then table.insert(ownedBucket, entry)
+		elseif #otherBucket < Cfg.MAX_RESULTS then table.insert(otherBucket, entry) end
+		return
+	end
+	local ownedKeys = {}
+	if petMap then
+		for mutKey, st in pairs(petMap) do
+			if st.total > 0 then table.insert(ownedKeys, mutKey) end
+		end
+	end
+	if #ownedKeys > 0 then
+		table.sort(ownedKeys, function(a, b)
+			local oa, ob = Cfg.MUTATION_ORDER[a] or 50, Cfg.MUTATION_ORDER[b] or 50
+			if oa ~= ob then return oa < ob end
+			return a < b
+		end)
+		for _, k in ipairs(ownedKeys) do table.insert(ownedBucket, { pet = pet, mutKey = k }) end
+	elseif #otherBucket < Cfg.MAX_RESULTS then
+		table.insert(otherBucket, { pet = pet, mutKey = "normal" })
+	end
+end
+
+function F.updateSearchResults(preserveScroll)
+	local prevCanvas = preserveScroll and UI.ResultScroll.CanvasPosition or nil
+	local query = string.lower(F.trimString(UI.SearchBox.Text))
+	local matches = {}
+	local function pushBuckets(buckets)
+		for _, list in ipairs(buckets) do
+			for _, entry in ipairs(list) do
+				table.insert(matches, entry)
+				if #matches >= Cfg.MAX_RESULTS then return end
+			end
+		end
+	end
+
+	if query == "" then
+		local ownedRows, otherRows = {}, {}
+		for _, p in ipairs(S.ownedPetsList) do
+			F.collectDistinctRowsForPet(p, ownedRows, otherRows)
+			if #ownedRows >= Cfg.MAX_RESULTS then break end
+		end
+		if #ownedRows < Cfg.MAX_RESULTS then
+			for _, p in ipairs(S.allPets) do
+				if not S.statsByPetAndMut[p.lowerId] then
+					F.collectDistinctRowsForPet(p, ownedRows, otherRows)
+					if #ownedRows + #otherRows >= Cfg.MAX_RESULTS then break end
+				end
+			end
+		end
+		pushBuckets({ ownedRows, otherRows })
+	else
+		local eO, eX, pO, pX, sO, sX = {}, {}, {}, {}, {}, {}
+		for _, p in ipairs(S.ownedPetsList) do
+			if p.lowerName == query then F.collectDistinctRowsForPet(p, eO, eX)
+			elseif string.sub(p.lowerName, 1, #query) == query then F.collectDistinctRowsForPet(p, pO, pX)
+			elseif string.find(p.searchBlob, query, 1, true) then F.collectDistinctRowsForPet(p, sO, sX) end
+		end
+		if #eO + #pO + #sO < Cfg.MAX_RESULTS then
+			for _, p in ipairs(S.allPets) do
+				if not S.statsByPetAndMut[p.lowerId] then
+					if p.lowerName == query then F.collectDistinctRowsForPet(p, eO, eX)
+					elseif string.sub(p.lowerName, 1, #query) == query then F.collectDistinctRowsForPet(p, pO, pX)
+					elseif string.find(p.searchBlob, query, 1, true) then F.collectDistinctRowsForPet(p, sO, sX) end
+					if #eX + #pX >= Cfg.MAX_RESULTS then break end
+				end
+			end
+		end
+		pushBuckets({ eO, pO, sO, eX, pX, sX })
+	end
+
+	for i = 1, Cfg.MAX_RESULTS do
+		local slot, entry = S.resultSlots[i], matches[i]
+		if entry then
+			local pet, mutKey = entry.pet, entry.mutKey
+			local meta = F.getMutationMeta(mutKey)
+			local sendable, eqCount, lockedCount = F.getPetMutStats(pet.lowerId, mutKey)
+			slot.entryRef, slot.Visible, slot.Button.Visible = entry, true, true
+			slot.Icon.Image = F.getIconForMutation(pet, mutKey)
+			slot.MutBadge.Text, slot.MutBadge.BackgroundColor3 = meta.short, meta.color
+			slot.NameLabel.Text = pet.displayName
+			if sendable > 0 then
+				slot.CountLabel.Text, slot.CountLabel.TextColor3 = "x" .. F.formatNumber(sendable), Color3.fromRGB(125, 225, 165)
+			elseif S.skipEquipped and eqCount > 0 then
+				slot.CountLabel.Text, slot.CountLabel.TextColor3 = "0 (eq:" .. F.formatNumber(eqCount) .. ")", Color3.fromRGB(245, 185, 95)
+			elseif lockedCount > 0 then
+				slot.CountLabel.Text, slot.CountLabel.TextColor3 = "0 (lock:" .. F.formatNumber(lockedCount) .. ")", Color3.fromRGB(235, 130, 130)
+			else
+				slot.CountLabel.Text, slot.CountLabel.TextColor3 = "x0", Color3.fromRGB(100, 112, 132)
+			end
+		else
+			slot.entryRef, slot.Visible, slot.Button.Visible = nil, false, false
+		end
+	end
+	UI.ResultScroll.CanvasPosition = (preserveScroll and prevCanvas) or Vector2.new(0, 0)
+	F.refreshSlotHighlights()
+end
+
+function F.rebuildMutationBarUI()
+	F.clearConnList(S.mutConnections)
+	for _, c in ipairs(UI.MutScroll:GetChildren()) do
+		if c:IsA("TextButton") then c:Destroy() end
+	end
+	for idx, entry in ipairs(S.activeFilters) do
+		local btn = Instance.new("TextButton")
+		btn.LayoutOrder, btn.Size, btn.BorderSizePixel = idx, UDim2.fromOffset(math.max(48, #entry.label * 7 + 14), 22), 0
+		btn.Font, btn.Text, btn.TextSize, btn.AutoButtonColor = Enum.Font.GothamBold, entry.label, 10, false
+		btn.Parent = UI.MutScroll
+		local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 5); c.Parent = btn
+		local isSel = (S.selectedMutFilter == entry.key)
+		btn.BackgroundColor3 = isSel and entry.color or Color3.fromRGB(26, 33, 46)
+		btn.TextColor3 = isSel and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(185, 198, 220)
+		table.insert(S.mutConnections, btn.MouseButton1Click:Connect(function()
+			if S.isSending then return end
+			S.selectedMutFilter = entry.key
+			if S.selectedEntry and not entry.isCategory then
+				S.selectedEntry = { pet = S.selectedEntry.pet, mutKey = S.selectedMutFilter }
+			end
+			F.rebuildMutationBarUI()
+			F.updateSearchResults(false)
+			F.updateSelectedPreview()
+		end))
+	end
+end
+
+function F.syncLiveInventoryUI(preserveScroll)
+	if S.isDestroyed then return end
+	local ok, _, _, _, mutChanged = F.refreshInventoryCounts(false, nil, true)
+	if ok then
+		if S.selectedEntry and S.selectedEntry.pet then
+			local refreshed = S.petByLowerId[S.selectedEntry.pet.lowerId]
+			if refreshed then S.selectedEntry.pet = refreshed end
+		end
+		if mutChanged then F.rebuildMutationBarUI() end
+		F.updateDiamondsUI()
+		F.updateSearchResults(preserveScroll)
+		F.updateSelectedPreview()
+	end
+end
+
+function F.applySendModeUI(mode)
+	S.sendMode = mode
+	local isSingle = (mode == "single")
+	UI.SinglePanel.Visible, UI.MultiPanel.Visible = isSingle, not isSingle
+	F.tweenProp(UI.TabSingleBtn, { BackgroundColor3 = isSingle and Color3.fromRGB(38, 134, 92) or Color3.fromRGB(24, 30, 42) }, 0.15)
+	F.tweenProp(UI.TabMultiBtn, { BackgroundColor3 = isSingle and Color3.fromRGB(24, 30, 42) or Color3.fromRGB(38, 134, 92) }, 0.15)
+	UI.TabSingleBtn.TextColor3 = isSingle and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(170, 184, 208)
+	UI.TabMultiBtn.TextColor3 = isSingle and Color3.fromRGB(170, 184, 208) or Color3.fromRGB(255, 255, 255)
+	if not S.isSending then UI.SendBtn.Text = isSingle and "SEND SINGLE (1 ACC)" or "SEND MULTI MAILBOX" end
+	F.updateRecipientBadges()
+	F.updateSelectedPreview()
+end
+
+function F.runSmartScan(forceGcSearch)
+	if S.isScanning or S.isDestroyed then return end
+	S.isScanning, UI.RefreshBtn.Text = true, "..."
+	local t0 = os.clock()
+	local okExec, errExec = pcall(function()
+		if not S.modulesLoaded then
+			F.setStatus("Loading game modules...", Color3.fromRGB(130, 200, 255))
+			F.initGameModulesAsync()
+		end
+		if S.isDestroyed then return end
+		local needGc = forceGcSearch or (S.cachedSaveTable == nil) or (F.scoreSaveTable(S.cachedSaveTable) <= 0)
+		local ok, totalSendable, uniqueVariants, source = F.refreshInventoryCounts(needGc, function(msg) F.setStatus(msg, Color3.fromRGB(130, 200, 255)) end, false)
+		if not ok and not S.isDestroyed then
+			for retry = 1, 2 do
+				F.setStatus("Waiting for Save data... retry (" .. tostring(retry) .. "/2)", Color3.fromRGB(245, 185, 95))
+				task.wait(0.8)
+				if S.isDestroyed then return end
+				ok, totalSendable, uniqueVariants, source = F.refreshInventoryCounts(true, function(msg) F.setStatus(msg, Color3.fromRGB(130, 200, 255)) end, false)
+				if ok then break end
+			end
+		end
+		if S.isDestroyed then return end
+		if S.selectedEntry and S.selectedEntry.pet then
+			local rp = S.petByLowerId[S.selectedEntry.pet.lowerId]
+			if rp then S.selectedEntry.pet = rp end
+		end
+		F.rebuildMutationBarUI()
+		F.updateDiamondsUI()
+		F.updateRecipientBadges()
+		F.updateSearchResults(false)
+		F.updateSelectedPreview()
+		local remote = F.findMailboxRemote()
+		local hasRemote = (remote ~= nil) or (type(S.NetworkMod) == "table" and type(rawget(S.NetworkMod, "Invoke")) == "function") or (type(S.cachedGcNetwork) == "table" and type(rawget(S.cachedGcNetwork, "Invoke")) == "function")
+		local mailTag = remote and remote.Name or (hasRemote and "Network" or "Missing")
+		if ok then
+			F.setStatus(string.format("Scan OK [%s | %.2fs] | %d groups (%s avail) | %s", source, os.clock() - t0, uniqueVariants, F.formatNumber(totalSendable), mailTag), hasRemote and Color3.fromRGB(130, 220, 165) or Color3.fromRGB(245, 175, 95))
+		else
+			F.setStatus("Failed to read Save [" .. tostring(source) .. "] - press Scan again.", Color3.fromRGB(245, 135, 120))
+		end
+		if not S.catalogBuilt then
+			F.trackThread(task.spawn(function()
+				F.buildFullCatalogOnce(function()
+					if not S.isDestroyed then F.updateSearchResults(true); F.updateSelectedPreview() end
+				end)
+			end))
+		end
+	end)
+	S.isScanning = false
+	if not S.isDestroyed then UI.RefreshBtn.Text = "Scan" end
+	if not okExec then F.setStatus("Scan error: " .. tostring(errExec), Color3.fromRGB(245, 110, 110)) end
+end
+
+function F.waitInterruptible(seconds, statusPrefix)
+	if seconds <= 0 then return not (S.cancelRequested or S.isDestroyed) end
+	if not statusPrefix and seconds <= 0.35 then
+		task.wait(seconds)
+		return not (S.cancelRequested or S.isDestroyed)
+	end
+	local deadline, lastShown = os.clock() + seconds, -1
+	while os.clock() < deadline do
+		if S.cancelRequested or S.isDestroyed then return false end
+		if statusPrefix then
+			local leftSec = math.max(1, math.ceil(deadline - os.clock()))
+			if leftSec ~= lastShown then
+				lastShown = leftSec
+				F.setStatus(string.format("%s (%ds)...", statusPrefix, leftSec), Color3.fromRGB(245, 200, 110))
+			end
+		end
+		task.wait(math.min(0.1, math.max(0.01, deadline - os.clock())))
+	end
+	return not (S.cancelRequested or S.isDestroyed)
+end
+
+function F.setSendingVisual(active)
+	if S.isDestroyed then return end
+	if active then
+		F.tweenProp(UI.SendBtn, { BackgroundColor3 = Color3.fromRGB(194, 58, 70) }, 0.14)
+		UI.SendBtn.Text = "STOP SENDING"
+	else
+		F.tweenProp(UI.SendBtn, { BackgroundColor3 = Color3.fromRGB(38, 166, 107) }, 0.14)
+		UI.SendBtn.Text = (S.sendMode == "single") and "SEND SINGLE (1 ACC)" or "SEND MULTI MAILBOX"
+	end
+end
+
+function F.stopSendingNow(reasonText)
+	S.cancelRequested = true
+	for _, k in ipairs({ "activeTimeoutThread", "activeInvokeThread", "sendThread" }) do
+		local th = S[k]
+		if th and coroutine.status(th) ~= "dead" then pcall(task.cancel, th) end
+		S[k] = nil
+	end
+	S.isSending = false
+	F.setSendingVisual(false)
+	if not S.isDestroyed then
+		F.syncLiveInventoryUI(true)
+		F.refreshUnsentButtons()
+		F.setStatus(reasonText or "Stopped sending.", Color3.fromRGB(245, 185, 95))
+	end
+end
+
+function F.startSending()
+	if S.isSending then F.stopSendingNow("Stopped sending.") return end
+	if S.isScanning then F.setStatus("Wait for scan to finish (~1s) before sending.", Color3.fromRGB(245, 185, 95)) return end
+
+	local activeMode, recipients = S.sendMode, {}
+	if activeMode == "single" then
+		local singleUser, errType = F.parseSingleRecipient(UI.SingleUserBox.Text)
+		if not singleUser then
+			F.setStatus(errType == "self" and "Cannot send to your own active account." or "Enter 1 valid username (3-20 chars).", Color3.fromRGB(245, 125, 120))
+			return
+		end
+		UI.SingleUserBox.Text = singleUser
+		recipients = { singleUser }
+	else
+		recipients = F.parseMultiRecipients(UI.MultiRecipBox.Text)
+		if #recipients == 0 then F.setStatus("Enter at least 1 valid username in Multi tab.", Color3.fromRGB(245, 125, 120)) return end
+	end
+
+	if not S.selectedEntry or not S.selectedEntry.pet then F.setStatus("Select a pet from the list first.", Color3.fromRGB(245, 175, 95)) return end
+	local qtyPerUser = F.getSanitizedQty()
+	if qtyPerUser <= 0 then F.setStatus("Enter quantity >= 1.", Color3.fromRGB(245, 125, 120)) return end
+
+	F.syncLiveInventoryUI(true)
+	local targetPet, targetMut = S.selectedEntry.pet, S.selectedEntry.mutKey
+	local targetMutLabel = F.getMutationMeta(targetMut).label
+	local sendableNow, eqNow = F.getPetMutStats(targetPet.lowerId, targetMut)
+	if sendableNow <= 0 then
+		F.setStatus((S.skipEquipped and eqNow > 0) and string.format("[%s] %s is equipped on Team (%s).", targetMutLabel, targetPet.displayName, F.formatNumber(eqNow)) or string.format("No [%s] %s available.", targetMutLabel, targetPet.displayName), Color3.fromRGB(245, 185, 95))
+		return
+	end
+
+	local userMinDelay = F.getSanitizedDelay()
+	local adaptiveDelay = userMinDelay
+	if activeMode == "multi" then
+		S.lastUnsentRecipients, S.currentBatchRecipients, S.currentBatchCompletedSet = {}, recipients, {}
+		UI.FilterUnsentBtn.Visible = false
+		F.updateMultiCounters(#recipients, #recipients, 0, 0)
+	end
+	F.setProgress(0)
+	S.isSending, S.cancelRequested = true, false
+	F.setSendingVisual(true)
+
+	S.sendThread = task.spawn(function()
+		local totalRecipients, totalSent, totalMails, totalFailed, usersCompleted = #recipients, 0, 0, 0, 0
+		local failedUserNotes, stopReason, lastErrText, maxRemainingByUid = {}, nil, "", {}
+		local batchStartClock, lastSuccessClock, cleanStreak, cachedSendCost = os.clock(), 0, 0, F.getMailboxSendCost()
+
+		local okRun, runErr = pcall(function()
+			local batchStacks, batchOk = F.collectBatchCandidateUids(targetPet.lowerId, targetMut)
+			if not batchOk then stopReason = "Lost Save Data connection." return end
+
+			for rIdx = 1, totalRecipients do
+				local recipient = recipients[rIdx]
+				if S.cancelRequested or S.isDestroyed then stopReason = "Stopped." break end
+
+				local sentForThisUser, remainingQty, skipRecipient, recipientFailReason, staleRetries = 0, qtyPerUser, false, nil, 0
+				while remainingQty > 0 do
+					if S.cancelRequested or S.isDestroyed or skipRecipient then break end
+					if lastSuccessClock > 0 and adaptiveDelay > 0 then
+						local waitLeft = (lastSuccessClock + adaptiveDelay) - os.clock()
+						if waitLeft > 0.015 then
+							local remAcc = totalRecipients - (usersCompleted + totalFailed)
+							local pfx = waitLeft >= 0.8 and string.format("[%d/%d | %d left] Wait %.1fs -> %s", rIdx, totalRecipients, remAcc, adaptiveDelay, recipient) or nil
+							if not F.waitInterruptible(waitLeft, pfx) then stopReason = "Stopped." break end
+						end
+					end
+
+					local cand, saveOk = F.pickFastBatchStack(batchStacks, targetPet.lowerId, targetMut, remainingQty, maxRemainingByUid)
+					if not saveOk then stopReason = "Lost Save Data connection."; S.cancelRequested = true; break end
+					if not cand then stopReason = string.format("Out of [%s] %s.", targetMutLabel, targetPet.displayName); S.cancelRequested = true; break end
+
+					local sendAmt = targetPet.isHugeOrTitanic and 1 or math.min(remainingQty, cand.avail)
+					if totalMails % 10 == 0 then cachedSendCost = F.getMailboxSendCost() end
+					local diamonds = F.getDiamonds()
+					if diamonds > 0 and diamonds < cachedSendCost then
+						stopReason = string.format("Not enough Diamonds! Need %s, have %s.", F.formatCompact(cachedSendCost), F.formatCompact(diamonds))
+						S.cancelRequested = true; break
+					end
+
+					local remAccBefore = totalRecipients - (usersCompleted + totalFailed)
+					local etaText = ""
+					if usersCompleted > 0 then
+						local avgSec = (os.clock() - batchStartClock) / usersCompleted
+						etaText = string.format(" | %.1f acc/m • ~%s", avgSec > 0 and (60 / avgSec) or 0, F.formatEta(avgSec * remAccBefore))
+					end
+					F.setStatus(string.format("[%d/%d | %d left] Sending %dx %s -> %s%s", rIdx, totalRecipients, remAccBefore, sendAmt, targetPet.displayName, recipient, etaText), Color3.fromRGB(130, 200, 255))
+
+					local sentOk, retryFreshStack, attemptErr, hitCooldown, successFireClock = false, false, "", false, 0
+					for attempt = 1, Cfg.MAX_COOLDOWN_RETRIES do
+						local fireClock = os.clock()
+						local okCall, errMsg, methodName = F.invokeMailboxSend(recipient, Cfg.MAIL_MESSAGE, cand.uid, sendAmt)
+						if okCall then sentOk, successFireClock = true, fireClock; break end
+						if S.cancelRequested or S.isDestroyed then stopReason = "Stopped." break end
+
+						local errStr = tostring(errMsg or "Server rejected")
+						attemptErr, lastErrText = errStr, string.format("[%s] %s", tostring(methodName or ""), errStr)
+						local le = string.lower(errStr)
+						if string.find(le, "diamond") or string.find(le, "gem") or string.find(le, "afford") or string.find(le, "cost") then
+							stopReason = "Not enough Diamonds: " .. errStr; S.cancelRequested = true; break
+						elseif string.find(le, "cooldown") or string.find(le, "fast") or string.find(le, "wait") or string.find(le, "busy") or string.find(le, "slow") or string.find(le, "again") or string.find(le, "second") or string.find(le, "minute") or string.find(le, "limit") then
+							hitCooldown, cleanStreak = true, 0
+							if attempt < Cfg.MAX_COOLDOWN_RETRIES then
+								local waitSec, hasExact = F.parseCooldownSeconds(errStr, attempt)
+								if hasExact and lastSuccessClock > 0 then
+									local totalCd = (os.clock() - lastSuccessClock) + waitSec
+									if totalCd >= userMinDelay and totalCd <= 65 then adaptiveDelay = math.ceil(totalCd * 10) / 10 end
+								end
+								local cdPfx = waitSec >= 1.0 and string.format("[%d/%d | %d left] Cooldown -> %s", rIdx, totalRecipients, remAccBefore, recipient) or nil
+								if not F.waitInterruptible(waitSec, cdPfx) then stopReason = "Stopped." break end
+							else
+								skipRecipient, recipientFailReason = true, "Cooldown retries exhausted: " .. errStr; break
+							end
+						elseif string.find(le, "item") and (string.find(le, "found") or string.find(le, "exist") or string.find(le, "missing") or string.find(le, "enough")) then
+							maxRemainingByUid[cand.uid] = 0; staleRetries = staleRetries + 1
+							if staleRetries <= 2 then retryFreshStack = true else skipRecipient, recipientFailReason = true, errStr end
+							break
+						else
+							skipRecipient, recipientFailReason = true, errStr; break
+						end
+					end
+
+					if S.cancelRequested or S.isDestroyed or skipRecipient then break end
+					if sentOk then
+						if lastSuccessClock > 0 then
+							if hitCooldown then
+								local gap = successFireClock - lastSuccessClock
+								if gap >= userMinDelay and gap <= 65 then adaptiveDelay = math.max(adaptiveDelay, math.ceil((gap + 0.05) * 10) / 10) end
+							else
+								cleanStreak = cleanStreak + 1
+								if adaptiveDelay > userMinDelay then
+									if adaptiveDelay < 10 and cleanStreak >= 2 then
+										cleanStreak = 0
+										adaptiveDelay = math.max(userMinDelay, math.floor((userMinDelay + (adaptiveDelay - userMinDelay) * 0.5) * 10) / 10)
+										if adaptiveDelay - userMinDelay < 0.15 then adaptiveDelay = userMinDelay end
+									elseif adaptiveDelay >= 10 and cleanStreak >= 5 then
+										cleanStreak = 0; adaptiveDelay = math.max(userMinDelay, adaptiveDelay - 1.0)
+									end
+								end
+							end
+						end
+						lastSuccessClock = successFireClock
+						maxRemainingByUid[cand.uid] = math.max(0, cand.cappedAm - sendAmt)
+						remainingQty, sentForThisUser, totalSent, totalMails = remainingQty - sendAmt, sentForThisUser + sendAmt, totalSent + sendAmt, totalMails + 1
+						F.syncLiveInventoryUI(true)
+					elseif retryFreshStack then
+						if not F.waitInterruptible(0.15, nil) then stopReason = "Stopped." break end
+					else
+						skipRecipient, recipientFailReason = true, (attemptErr ~= "" and attemptErr) or "Failed to send"; break
+					end
+				end
+
+				if sentForThisUser >= qtyPerUser then
+					usersCompleted = usersCompleted + 1
+					if activeMode == "multi" then S.currentBatchCompletedSet[recipient] = true; F.recordSentLog(recipient) end
+				elseif not S.cancelRequested and not S.isDestroyed then
+					totalFailed = totalFailed + 1
+					table.insert(failedUserNotes, recipient .. ": " .. tostring(recipientFailReason or "incomplete"))
+				end
+
+				local processed = usersCompleted + totalFailed
+				local remNow = math.max(0, totalRecipients - processed)
+				F.setProgress(processed / math.max(1, totalRecipients))
+				if activeMode == "multi" then
+					F.updateMultiCounters(totalRecipients, remNow, usersCompleted, totalFailed)
+					local el = math.max(0.01, os.clock() - batchStartClock)
+					local rpm = usersCompleted > 0 and (usersCompleted / el * 60) or 0
+					local eta = usersCompleted > 0 and ((el / usersCompleted) * remNow) or 0
+					F.setStatus(string.format("Done %d/%d | %d accs left | %.1f acc/m • ETA %s (%s)", usersCompleted, totalRecipients, remNow, rpm, F.formatEta(eta), recipient), Color3.fromRGB(125, 225, 165))
+				end
+			end
+		end)
+
+		S.isSending, S.sendThread, S.activeInvokeThread, S.activeTimeoutThread = false, nil, nil, nil
+		if S.isDestroyed then return end
+		F.setSendingVisual(false)
+		F.syncLiveInventoryUI(true)
+		F.refreshUnsentButtons()
+
+		local elapsedSec = math.max(0.01, os.clock() - batchStartClock)
+		local totalDur, spm = F.formatEta(elapsedSec), usersCompleted > 0 and (usersCompleted / elapsedSec * 60) or 0
+		if not okRun then
+			F.setStatus("Runtime error: " .. tostring(runErr), Color3.fromRGB(245, 100, 100))
+		elseif stopReason then
+			F.setStatus(string.format("%s (%d/%d accs | %s sent | %s)", stopReason, usersCompleted, totalRecipients, F.formatNumber(totalSent), totalDur), Color3.fromRGB(245, 165, 110))
+		elseif totalFailed > 0 then
+			F.setStatus(string.format("Done %d/%d accs (%s | %.1f/m) | %d fail: %s", usersCompleted, totalRecipients, totalDur, spm, totalFailed, table.concat(failedUserNotes, "; ")), Color3.fromRGB(245, 145, 110))
+		elseif activeMode == "single" then
+			F.setStatus(string.format("Sent %s [%s] %s -> %s (%s)!", F.formatNumber(totalSent), targetMutLabel, targetPet.displayName, recipients[1], totalDur), Color3.fromRGB(115, 225, 155))
+		else
+			F.setStatus(string.format("Finished %d/%d accs in %s! (%.1f acc/m | %s [%s] %s)", usersCompleted, totalRecipients, totalDur, spm, F.formatNumber(totalSent), targetMutLabel, targetPet.displayName), Color3.fromRGB(115, 225, 155))
+		end
+	end)
+end
+
+-- Anti-AFK + Wiring
+F.trackConn(LocalPlayer.Idled:Connect(function()
+	if S.isDestroyed or not S.antiAfkEnabled then return end
+	pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
+end))
+F.trackThread(task.spawn(function()
+	while not S.isDestroyed do
+		task.wait(300)
+		if S.isDestroyed then break end
+		if S.antiAfkEnabled then pcall(function() VirtualUser:CaptureController() end) end
+	end
+end))
+
+do
+	local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+	F.trackConn(UI.Header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragInput, dragStart, startPos = true, input, input.Position, UI.MainFrame.Position
+		end
+	end))
+	F.trackConn(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			local curVp = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1280, 720)
+			local size = UI.MainFrame.AbsoluteSize
+			UI.MainFrame.Position = UDim2.fromOffset(math.clamp(startPos.X.Offset + delta.X, 0, math.max(0, curVp.X - size.X)), math.clamp(startPos.Y.Offset + delta.Y, 0, math.max(0, curVp.Y - UI.headerHeight)))
+		end
+	end))
+	F.trackConn(UserInputService.InputEnded:Connect(function(input)
+		if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragInput = false, nil
+		end
+	end))
+
+	F.trackConn(UI.MinBtn.MouseButton1Click:Connect(function()
+		S.isMinimized = not S.isMinimized
+		UI.MinBtn.Text = S.isMinimized and "+" or "-"
+		if S.isMinimized then
+			UI.Body.Visible = false
+			F.tweenProp(UI.MainFrame, { Size = UDim2.fromOffset(UI.winWidth, UI.headerHeight) }, 0.16)
+		else
+			UI.Body.Visible = true
+			F.tweenProp(UI.MainFrame, { Size = UDim2.fromOffset(UI.winWidth, UI.winHeight) }, 0.18)
+		end
+	end))
+
+	local function cleanup()
+		if S.isDestroyed then return end
+		S.isDestroyed, S.cancelRequested, S.isSending, S.isScanning = true, true, false, false
+		for _, k in ipairs({ "activeTimeoutThread", "activeInvokeThread", "sendThread" }) do
+			if S[k] and coroutine.status(S[k]) ~= "dead" then pcall(task.cancel, S[k]) end
+			S[k] = nil
+		end
+		for i = #S.activeThreads, 1, -1 do
+			if S.activeThreads[i] and coroutine.status(S.activeThreads[i]) ~= "dead" then pcall(task.cancel, S.activeThreads[i]) end
+			S.activeThreads[i] = nil
+		end
+		F.clearConnList(S.mutConnections)
+		F.clearConnList(S.connections)
+		if UI.ScreenGui and UI.ScreenGui.Parent then UI.ScreenGui:Destroy() end
+	end
+	globalEnv.PS99_AutoMailbox_Cleanup = cleanup
+	F.trackConn(UI.CloseBtn.MouseButton1Click:Connect(cleanup))
+
+	F.trackConn(UI.AfkBadgeBtn.MouseButton1Click:Connect(function()
+		S.antiAfkEnabled = not S.antiAfkEnabled
+		UI.AfkBadgeBtn.Text = S.antiAfkEnabled and "AFK: ON" or "AFK: OFF"
+		UI.AfkBadgeBtn.TextColor3 = S.antiAfkEnabled and Color3.fromRGB(145, 240, 185) or Color3.fromRGB(220, 165, 165)
+		F.tweenProp(UI.AfkBadgeBtn, { BackgroundColor3 = S.antiAfkEnabled and Color3.fromRGB(26, 78, 56) or Color3.fromRGB(68, 42, 48) }, 0.14)
+		UI.AfkStroke.Color = S.antiAfkEnabled and Color3.fromRGB(48, 140, 96) or Color3.fromRGB(130, 72, 82)
+	end))
+
+	F.trackConn(UI.TabSingleBtn.MouseButton1Click:Connect(function() if not S.isSending and S.sendMode ~= "single" then F.applySendModeUI("single") end end))
+	F.trackConn(UI.TabMultiBtn.MouseButton1Click:Connect(function() if not S.isSending and S.sendMode ~= "multi" then F.applySendModeUI("multi") end end))
+
+	local function sanitizeSingleBox(isFinal)
+		if S.sanitizingSingleBox then return end
+		local raw = UI.SingleUserBox.Text or ""
+		local hasMulti = (string.find(raw, "[\r\n|,;%s]") ~= nil)
+		if hasMulti or isFinal then
+			local first = ""
+			for seg in string.gmatch(raw, "([^|\r\n,;%s]+)") do
+				local clean = string.gsub(seg, "[^A-Za-z0-9_]", "")
+				if clean ~= "" then first = string.sub(clean, 1, 20); break end
+			end
+			if first ~= raw then
+				S.sanitizingSingleBox = true; UI.SingleUserBox.Text = first; S.sanitizingSingleBox = false
+				S.singleWarnNote = hasMulti and "1 acc only (kept first)" or nil
+			else
+				S.singleWarnNote = nil
+			end
+		else
+			local clean = string.sub(string.gsub(raw, "[^A-Za-z0-9_]", ""), 1, 20)
+			if clean ~= raw then S.sanitizingSingleBox = true; UI.SingleUserBox.Text = clean; S.sanitizingSingleBox = false end
+			S.singleWarnNote = nil
+		end
+	end
+
+	F.trackConn(UI.SingleUserBox:GetPropertyChangedSignal("Text"):Connect(function() pcall(function() sanitizeSingleBox(false); F.updateRecipientBadges(); F.updateSelectedPreview() end) end))
+	F.trackConn(UI.SingleUserBox.FocusLost:Connect(function() pcall(function() sanitizeSingleBox(true); F.updateRecipientBadges(); F.updateSelectedPreview() end) end))
+	F.trackConn(UI.MultiRecipBox:GetPropertyChangedSignal("Text"):Connect(function()
+		pcall(function()
+			F.updateRecipientBadges(); F.updateSelectedPreview()
+			if not S.isSending and not S.isScanning then F.setStatus("Ready.", Color3.fromRGB(165, 205, 180)) end
+		end)
+	end))
+	F.trackConn(UI.QtyBox:GetPropertyChangedSignal("Text"):Connect(function() pcall(F.updateSelectedPreview) end))
+	F.trackConn(UI.SearchBox:GetPropertyChangedSignal("Text"):Connect(function() pcall(F.updateSearchResults, false) end))
+
+	F.trackConn(UI.TeamToggleBtn.MouseButton1Click:Connect(function()
+		if S.isSending or S.isScanning then return end
+		pcall(function()
+			S.skipEquipped = not S.skipEquipped
+			UI.TeamToggleBtn.Text = S.skipEquipped and "Eq: Skip" or "Eq: Allow"
+			F.tweenProp(UI.TeamToggleBtn, { BackgroundColor3 = S.skipEquipped and Color3.fromRGB(42, 56, 78) or Color3.fromRGB(148, 94, 38) }, 0.14)
+			F.syncLiveInventoryUI(true)
+		end)
+	end))
+
+	F.trackConn(UI.GoMailboxBtn.MouseButton1Click:Connect(function()
+		if S.isSending then return end
+		F.trackThread(task.spawn(function() local okM, msg = F.moveToPhysicalMailbox(); F.setStatus(msg, okM and Color3.fromRGB(125, 225, 165) or Color3.fromRGB(245, 165, 95)) end))
+	end))
+
+	F.trackConn(UI.RefreshBtn.MouseButton1Click:Connect(function()
+		if S.isSending or S.isScanning then return end
+		F.trackThread(task.spawn(function() F.runSmartScan((S.cachedSaveTable == nil) or (F.scoreSaveTable(S.cachedSaveTable) <= 0)) end))
+	end))
+
+	F.trackConn(UI.SendBtn.MouseButton1Click:Connect(function()
+		local ok, err = pcall(F.startSending)
+		if not ok then F.setStatus("Send error: " .. tostring(err), Color3.fromRGB(245, 110, 110)) end
+	end))
+
+	F.trackConn(UI.FilterUnsentBtn.MouseButton1Click:Connect(function()
+		if S.isSending then return end
+		F.refreshUnsentButtons()
+		if #S.lastUnsentRecipients == 0 then F.setStatus("All accounts in list were already sent.", Color3.fromRGB(125, 225, 165)) return end
+		UI.MultiRecipBox.Text = table.concat(S.lastUnsentRecipients, "\n")
+		F.updateRecipientBadges(); F.updateSelectedPreview()
+		F.setStatus("Filtered down to " .. tostring(#S.lastUnsentRecipients) .. " unsent accs.", Color3.fromRGB(245, 185, 95))
+	end))
+
+	F.trackConn(UI.ClearLogBtn.MouseButton1Click:Connect(function()
+		if S.isSending then return end
+		F.clearSentLogFile(); S.currentBatchCompletedSet = nil; F.refreshUnsentButtons()
+		F.setStatus("Cleared sent account log.", Color3.fromRGB(165, 205, 180))
+	end))
+
+	F.trackConn(UI.CheckMailLogBtn.MouseButton1Click:Connect(function()
+		local save = S.cachedSaveTable or F.resolveLiveSave(false)
+		local mailLog = type(save) == "table" and rawget(save, "MailLog") or nil
+		if type(mailLog) ~= "table" or #mailLog == 0 then F.setStatus("Could not read recent MailLog from Save.", Color3.fromRGB(245, 165, 95)) return end
+		local sentList = {}
+		for _, entry in ipairs(mailLog) do
+			if type(entry) == "table" and rawget(entry, "Sender") == nil then
+				local rn = rawget(entry, "RecieverName") or rawget(entry, "ReceiverName")
+				if type(rn) == "string" and rn ~= "" then table.insert(sentList, { name = rn, ts = tonumber(rawget(entry, "Timestamp")) or 0 }) end
+			end
+		end
+		if #sentList == 0 then F.setStatus("No outgoing MailLog entries found yet.", Color3.fromRGB(245, 165, 95)) return end
+		table.sort(sentList, function(a, b) return a.ts > b.ts end)
+		local preview, allNames = {}, {}
+		for i, v in ipairs(sentList) do
+			allNames[i] = v.name
+			if i <= 5 then preview[i] = v.name end
+		end
+		if type(setclipboard) == "function" then pcall(setclipboard, table.concat(allNames, "\n")) end
+		F.setStatus("Latest (" .. tostring(#sentList) .. " - copied): " .. table.concat(preview, ", "), Color3.fromRGB(125, 220, 255))
+	end))
+end
+
+F.rebuildMutationRegistry({})
+F.rebuildMutationBarUI()
+F.applySendModeUI("multi")
+
+F.trackThread(task.spawn(function()
+	F.runSmartScan(false)
+end))
