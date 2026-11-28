@@ -101,6 +101,10 @@ local S = {
 	lastUnsentRecipients = {},
 	currentBatchRecipients = nil,
 	currentBatchCompletedSet = nil,
+	activeBatchRemainingUnits = nil,
+	updatingMultiBox = false,
+	liveMultiBoxList = nil,
+	lastWrittenMultiText = nil,
 
 	sentLogSet = {},
 	sentLogCount = 0,
@@ -891,14 +895,17 @@ function F.ensurePetRecord(petId)
 				if F.isValidFiniteNumber(pv) then existing.power = pv end
 			end
 			if rawget(dir, "huge") == true then existing.isHuge, existing.isHugeOrTitanic = true, true end
-			if rawget(dir, "titanic") == true or rawget(dir, "gargantuan") == true then existing.isHugeOrTitanic = true end
+			if rawget(dir, "titanic") == true or rawget(dir, "gargantuan") == true then existing.isTitanic, existing.isHugeOrTitanic = true, true end
+			if rawget(dir, "tradable") == false then existing.isDirUntradeable = true end
 		end
 		return existing
 	end
 
 	local displayName, thumb, goldThumb, power = petId, "", "", 0
 	local isHuge = (string.sub(petId, 1, 5) == "Huge ")
-	local isHugeOrTitanic = isHuge or (string.sub(petId, 1, 8) == "Titanic ") or (string.sub(petId, 1, 11) == "Gargantuan ")
+	local isTitanic = (string.sub(petId, 1, 8) == "Titanic ") or (string.sub(petId, 1, 11) == "Gargantuan ")
+	local isHugeOrTitanic = isHuge or isTitanic
+	local isDirUntradeable = false
 	if type(dir) == "table" then
 		local rawName = rawget(dir, "name")
 		if type(rawName) == "string" and rawName ~= "" then displayName = rawName end
@@ -909,18 +916,32 @@ function F.ensurePetRecord(petId)
 		local pv = rawget(dir, "power")
 		if F.isValidFiniteNumber(pv) then power = pv end
 		if rawget(dir, "huge") == true then isHuge, isHugeOrTitanic = true, true end
-		if rawget(dir, "titanic") == true or rawget(dir, "gargantuan") == true then isHugeOrTitanic = true end
+		if rawget(dir, "titanic") == true or rawget(dir, "gargantuan") == true then isTitanic, isHugeOrTitanic = true, true end
+		if rawget(dir, "tradable") == false then isDirUntradeable = true end
 	end
 	local meta = S.dirOrderMap[lowerId] or S.dirOrderMap[string.lower(displayName)]
 	local rec = {
 		petId = petId, lowerId = lowerId, displayName = displayName, lowerName = string.lower(displayName),
 		searchBlob = string.lower(displayName .. " " .. petId), thumbnail = thumb, goldenThumbnail = goldThumb,
 		power = power, zoneNum = meta and meta.zoneNum or 0, dirOrder = meta and meta.order or 0,
-		isHuge = isHuge, isHugeOrTitanic = isHugeOrTitanic,
+		isHuge = isHuge, isTitanic = isTitanic, isHugeOrTitanic = isHugeOrTitanic, isDirUntradeable = isDirUntradeable,
 	}
 	S.petByLowerId[lowerId] = rec
 	table.insert(S.allPets, rec)
 	return rec
+end
+
+function F.isStackUntradeable(item, pet)
+	if pet and pet.isTitanic then return true end
+	local to = rawget(item, "_to")
+	if to == false then return true end
+	if to ~= true and pet and pet.isDirUntradeable then return true end
+	local uq = rawget(item, "_uq")
+	if type(uq) == "table" then
+		local tul = rawget(uq, "_tul")
+		if type(tul) == "number" and tul > workspace:GetServerTimeNow() then return true end
+	end
+	return false
 end
 
 function F.sortPetsList(list)
@@ -949,31 +970,34 @@ function F.refreshInventoryCounts(forceGc, progressCb, fastMode)
 		if type(uid) == "string" and type(item) == "table" then
 			local id = rawget(item, "id")
 			if type(id) == "string" and id ~= "" then
-				local lowerId = string.lower(id)
-				local am = F.getItemAmount(item)
-				local locked = F.isItemLocked(item)
-				local eqInStack = math.min(am, eqCounts[uid] or (F.isItemMarkedEquipped(item) and 1 or 0))
-				local primaryKey, _, extras = F.getItemMutationInfo(item)
+				local petRec = F.ensurePetRecord(id)
+				if not F.isStackUntradeable(item, petRec) then
+					local lowerId = string.lower(id)
+					local am = F.getItemAmount(item)
+					local locked = F.isItemLocked(item)
+					local eqInStack = math.min(am, eqCounts[uid] or (F.isItemMarkedEquipped(item) and 1 or 0))
+					local primaryKey, _, extras = F.getItemMutationInfo(item)
 
-				local petMap = S.statsByPetAndMut[lowerId]
-				if not petMap then petMap = {}; S.statsByPetAndMut[lowerId] = petMap end
-				if not ownedSeenLower[lowerId] then
-					ownedSeenLower[lowerId] = true
-					table.insert(S.ownedPetsList, F.ensurePetRecord(id))
-				end
-				F.addStatBucket(petMap, primaryKey, am, locked, eqInStack)
-				for _, exName in ipairs(extras) do
-					table.insert(discoveredExtras, exName)
-					local exKey = "extra:" .. string.lower(exName)
-					if exKey ~= primaryKey then F.addStatBucket(petMap, exKey, am, locked, eqInStack) end
-				end
-				local pairKey = lowerId .. "\0" .. primaryKey
-				if not countedVariantKeys[pairKey] then
-					countedVariantKeys[pairKey] = true
-					uniqueVariantsCount = uniqueVariantsCount + 1
-				end
-				if not locked then
-					totalSendableAll = totalSendableAll + (S.skipEquipped and math.max(0, am - eqInStack) or am)
+					local petMap = S.statsByPetAndMut[lowerId]
+					if not petMap then petMap = {}; S.statsByPetAndMut[lowerId] = petMap end
+					if not ownedSeenLower[lowerId] then
+						ownedSeenLower[lowerId] = true
+						table.insert(S.ownedPetsList, petRec)
+					end
+					F.addStatBucket(petMap, primaryKey, am, locked, eqInStack)
+					for _, exName in ipairs(extras) do
+						table.insert(discoveredExtras, exName)
+						local exKey = "extra:" .. string.lower(exName)
+						if exKey ~= primaryKey then F.addStatBucket(petMap, exKey, am, locked, eqInStack) end
+					end
+					local pairKey = lowerId .. "\0" .. primaryKey
+					if not countedVariantKeys[pairKey] then
+						countedVariantKeys[pairKey] = true
+						uniqueVariantsCount = uniqueVariantsCount + 1
+					end
+					if not locked then
+						totalSendableAll = totalSendableAll + (S.skipEquipped and math.max(0, am - eqInStack) or am)
+					end
 				end
 			end
 		end
@@ -989,17 +1013,6 @@ function F.buildFullCatalogOnce(onDone)
 		return
 	end
 	S.catalogBuilt = true
-	if type(S.PetDirectory) == "table" then
-		local n = 0
-		for petId, dir in pairs(S.PetDirectory) do
-			if S.isDestroyed then return end
-			if type(petId) == "string" and type(dir) == "table" then F.ensurePetRecord(petId) end
-			n = n + 1
-			if n % 800 == 0 then task.wait() end
-		end
-		F.sortPetsList(S.allPets)
-		if onDone and not S.isDestroyed then onDone() end
-	end
 	if not S.dirOrderReady then
 		S.dirOrderReady = true
 		local rawDirRoot = ReplicatedStorage:FindFirstChild("__DIRECTORY")
@@ -1028,7 +1041,6 @@ function F.buildFullCatalogOnce(onDone)
 				end
 				if i % 600 == 0 then task.wait() end
 			end
-			F.sortPetsList(S.allPets)
 			F.sortPetsList(S.ownedPetsList)
 			if onDone and not S.isDestroyed then onDone() end
 		end
@@ -1129,12 +1141,11 @@ function F.pickBestLiveStack(targetLowerId, targetMutKey, remainingNeeded, maxRe
 	local inv = save and rawget(save, "Inventory")
 	local invPets = type(inv) == "table" and rawget(inv, "Pet") or nil
 	if type(invPets) ~= "table" then return nil, false end
-	local eqCounts = F.getEquippedCountByUid(save)
-	local bestCandidate = nil
+	local eqCounts, petRec, bestCandidate = F.getEquippedCountByUid(save), S.petByLowerId[targetLowerId], nil
 	for uid, item in pairs(invPets) do
 		if type(uid) == "string" and type(item) == "table" then
 			local id = rawget(item, "id")
-			if type(id) == "string" and string.lower(id) == targetLowerId and not F.isItemLocked(item) and F.itemMatchesExactMutation(item, targetMutKey) then
+			if type(id) == "string" and string.lower(id) == targetLowerId and not F.isItemLocked(item) and not F.isStackUntradeable(item, petRec) and F.itemMatchesExactMutation(item, targetMutKey) then
 				local liveAm = F.getItemAmount(item)
 				local cappedAm = maxRemainingByUid[uid] and math.min(liveAm, maxRemainingByUid[uid]) or liveAm
 				local eqInStack = S.skipEquipped and math.min(cappedAm, eqCounts[uid] or (F.isItemMarkedEquipped(item) and 1 or 0)) or 0
@@ -1157,12 +1168,11 @@ function F.collectBatchCandidateUids(targetLowerId, targetMutKey)
 	local inv = save and rawget(save, "Inventory")
 	local invPets = type(inv) == "table" and rawget(inv, "Pet") or nil
 	if type(invPets) ~= "table" then return {}, false end
-	local eqCounts = F.getEquippedCountByUid(save)
-	local uids = {}
+	local eqCounts, petRec, uids = F.getEquippedCountByUid(save), S.petByLowerId[targetLowerId], {}
 	for uid, item in pairs(invPets) do
 		if type(uid) == "string" and type(item) == "table" then
 			local id = rawget(item, "id")
-			if type(id) == "string" and string.lower(id) == targetLowerId and not F.isItemLocked(item) and F.itemMatchesExactMutation(item, targetMutKey) then
+			if type(id) == "string" and string.lower(id) == targetLowerId and not F.isItemLocked(item) and not F.isStackUntradeable(item, petRec) and F.itemMatchesExactMutation(item, targetMutKey) then
 				local liveAm = F.getItemAmount(item)
 				local eqInStack = S.skipEquipped and math.min(liveAm, eqCounts[uid] or (F.isItemMarkedEquipped(item) and 1 or 0)) or 0
 				if liveAm - eqInStack > 0 then table.insert(uids, { uid = uid, eq = eqInStack }) end
@@ -1177,11 +1187,11 @@ function F.pickFastBatchStack(batchList, targetLowerId, targetMutKey, remainingN
 	local inv = save and rawget(save, "Inventory")
 	local invPets = type(inv) == "table" and rawget(inv, "Pet") or nil
 	if type(invPets) ~= "table" then return nil, false end
-	local bestCandidate = nil
+	local petRec, bestCandidate = S.petByLowerId[targetLowerId], nil
 	for i = #batchList, 1, -1 do
 		local entry = batchList[i]
 		local item = rawget(invPets, entry.uid)
-		if type(item) ~= "table" or F.isItemLocked(item) then
+		if type(item) ~= "table" or F.isItemLocked(item) or F.isStackUntradeable(item, petRec) then
 			table.remove(batchList, i)
 		else
 			local liveAm = F.getItemAmount(item)
@@ -1423,6 +1433,46 @@ function F.getActiveRecipients()
 	return (F.parseMultiRecipients(UI.MultiRecipBox.Text))
 end
 
+function F.removeCompletedFromMultiBox(completedLowerSet)
+	if S.isDestroyed then return end
+	local sourceList = (S.liveMultiBoxList and UI.MultiRecipBox.Text == S.lastWrittenMultiText)
+		and S.liveMultiBoxList
+		or F.parseMultiRecipients(UI.MultiRecipBox.Text)
+	local kept = {}
+	for _, name in ipairs(sourceList) do
+		if not completedLowerSet[string.lower(name)] then
+			table.insert(kept, name)
+		end
+	end
+	local nextText = table.concat(kept, "\n")
+	S.liveMultiBoxList = kept
+	S.lastWrittenMultiText = nextText
+	S.lastRecipRaw = nextText
+	S.cachedRecipients = kept
+	S.cachedInvalidCount = 0
+	if nextText ~= UI.MultiRecipBox.Text then
+		S.updatingMultiBox = true
+		UI.MultiRecipBox.Text = nextText
+		S.updatingMultiBox = false
+	end
+	if #kept > 0 then
+		UI.MultiBadge.Text, UI.MultiBadge.TextColor3 = string.format("%d accs", #kept), Color3.fromRGB(115, 220, 155)
+	else
+		UI.MultiBadge.Text, UI.MultiBadge.TextColor3 = "0 accs", Color3.fromRGB(145, 160, 185)
+	end
+end
+
+function F.recomputeRemainingUnits(waveQueue)
+	local rem = 0
+	for _, item in ipairs(waveQueue) do
+		if item.remaining > 0 and not item.perm then
+			rem = rem + item.remaining
+		end
+	end
+	S.activeBatchRemainingUnits = rem
+	return rem
+end
+
 function F.updateMultiCounters(total, remaining, doneCount, failCount)
 	if S.isDestroyed then return end
 	UI.MultiCounterLabel.Text = string.format("Total: %s | Left: %s | Sent: %s | Fail: %s", F.formatNumber(total), F.formatNumber(remaining), F.formatNumber(doneCount), F.formatNumber(failCount))
@@ -1525,15 +1575,26 @@ function F.updateSelectedPreview()
 	local pet, mutKey = S.selectedEntry.pet, S.selectedEntry.mutKey
 	local meta = F.getMutationMeta(mutKey)
 	local sendable, eqCount, lockedCount = F.getPetMutStats(pet.lowerId, mutKey)
-	local needed = F.getSanitizedQty() * math.max(1, #F.getActiveRecipients())
+	local qty = F.getSanitizedQty()
+	local activeRecips = F.getActiveRecipients()
+	local needed
+	if S.isSending and S.activeBatchRemainingUnits ~= nil then
+		needed = S.activeBatchRemainingUnits
+	elseif S.sendMode == "single" then
+		needed = qty
+	else
+		needed = qty * #activeRecips
+	end
 
 	UI.SelectedStroke.Color = meta.color
 	UI.SelectedIcon.Image = F.getIconForMutation(pet, mutKey)
 	UI.SelectedNameLabel.Text = string.format("[%s] %s", meta.label, pet.displayName)
 	local note = (S.skipEquipped and eqCount > 0 and (" (eq:" .. F.formatNumber(eqCount) .. ")")) or (lockedCount > 0 and (" (lock:" .. F.formatNumber(lockedCount) .. ")")) or ""
 
-	if F.getSanitizedQty() <= 0 then
+	if qty <= 0 then
 		UI.SelectedMetaLabel.Text, UI.SelectedMetaLabel.TextColor3 = string.format("Avail: %s%s | Enter Qty >= 1", F.formatNumber(sendable), note), Color3.fromRGB(245, 185, 95)
+	elseif not S.isSending and S.sendMode == "multi" and #activeRecips == 0 then
+		UI.SelectedMetaLabel.Text, UI.SelectedMetaLabel.TextColor3 = string.format("Avail: %s%s | Need: 0 (0 accs)", F.formatNumber(sendable), note), Color3.fromRGB(165, 205, 180)
 	elseif sendable >= needed then
 		UI.SelectedMetaLabel.Text, UI.SelectedMetaLabel.TextColor3 = string.format("Avail: %s%s | Need: %s (OK)", F.formatNumber(sendable), note, F.formatNumber(needed)), Color3.fromRGB(125, 225, 165)
 	else
@@ -1553,21 +1614,19 @@ function F.refreshSlotHighlights()
 	end
 end
 
-function F.collectDistinctRowsForPet(pet, ownedBucket, otherBucket)
+function F.collectDistinctRowsForPet(pet, ownedBucket)
+	if pet.isTitanic then return end
 	if S.selectedMutFilter == "huge" and not pet.isHuge then return end
 	local petMap = S.statsByPetAndMut[pet.lowerId]
+	if not petMap then return end
 	if S.selectedMutFilter ~= "all" and S.selectedMutFilter ~= "huge" then
-		local st = petMap and petMap[S.selectedMutFilter]
-		local entry = { pet = pet, mutKey = S.selectedMutFilter }
-		if st and st.total > 0 then table.insert(ownedBucket, entry)
-		elseif #otherBucket < Cfg.MAX_RESULTS then table.insert(otherBucket, entry) end
+		local st = petMap[S.selectedMutFilter]
+		if st and st.total > 0 then table.insert(ownedBucket, { pet = pet, mutKey = S.selectedMutFilter }) end
 		return
 	end
 	local ownedKeys = {}
-	if petMap then
-		for mutKey, st in pairs(petMap) do
-			if st.total > 0 then table.insert(ownedKeys, mutKey) end
-		end
+	for mutKey, st in pairs(petMap) do
+		if st.total > 0 then table.insert(ownedKeys, mutKey) end
 	end
 	if #ownedKeys > 0 then
 		table.sort(ownedKeys, function(a, b)
@@ -1576,8 +1635,6 @@ function F.collectDistinctRowsForPet(pet, ownedBucket, otherBucket)
 			return a < b
 		end)
 		for _, k in ipairs(ownedKeys) do table.insert(ownedBucket, { pet = pet, mutKey = k }) end
-	elseif #otherBucket < Cfg.MAX_RESULTS then
-		table.insert(otherBucket, { pet = pet, mutKey = "normal" })
 	end
 end
 
@@ -1595,38 +1652,20 @@ function F.updateSearchResults(preserveScroll)
 	end
 
 	if query == "" then
-		local ownedRows, otherRows = {}, {}
+		local ownedRows = {}
 		for _, p in ipairs(S.ownedPetsList) do
-			F.collectDistinctRowsForPet(p, ownedRows, otherRows)
+			F.collectDistinctRowsForPet(p, ownedRows)
 			if #ownedRows >= Cfg.MAX_RESULTS then break end
 		end
-		if #ownedRows < Cfg.MAX_RESULTS then
-			for _, p in ipairs(S.allPets) do
-				if not S.statsByPetAndMut[p.lowerId] then
-					F.collectDistinctRowsForPet(p, ownedRows, otherRows)
-					if #ownedRows + #otherRows >= Cfg.MAX_RESULTS then break end
-				end
-			end
-		end
-		pushBuckets({ ownedRows, otherRows })
+		pushBuckets({ ownedRows })
 	else
-		local eO, eX, pO, pX, sO, sX = {}, {}, {}, {}, {}, {}
+		local eO, pO, sO = {}, {}, {}
 		for _, p in ipairs(S.ownedPetsList) do
-			if p.lowerName == query then F.collectDistinctRowsForPet(p, eO, eX)
-			elseif string.sub(p.lowerName, 1, #query) == query then F.collectDistinctRowsForPet(p, pO, pX)
-			elseif string.find(p.searchBlob, query, 1, true) then F.collectDistinctRowsForPet(p, sO, sX) end
+			if p.lowerName == query then F.collectDistinctRowsForPet(p, eO)
+			elseif string.sub(p.lowerName, 1, #query) == query then F.collectDistinctRowsForPet(p, pO)
+			elseif string.find(p.searchBlob, query, 1, true) then F.collectDistinctRowsForPet(p, sO) end
 		end
-		if #eO + #pO + #sO < Cfg.MAX_RESULTS then
-			for _, p in ipairs(S.allPets) do
-				if not S.statsByPetAndMut[p.lowerId] then
-					if p.lowerName == query then F.collectDistinctRowsForPet(p, eO, eX)
-					elseif string.sub(p.lowerName, 1, #query) == query then F.collectDistinctRowsForPet(p, pO, pX)
-					elseif string.find(p.searchBlob, query, 1, true) then F.collectDistinctRowsForPet(p, sO, sX) end
-					if #eX + #pX >= Cfg.MAX_RESULTS then break end
-				end
-			end
-		end
-		pushBuckets({ eO, pO, sO, eX, pX, sX })
+		pushBuckets({ eO, pO, sO })
 	end
 
 	for i = 1, Cfg.MAX_RESULTS do
@@ -1803,6 +1842,7 @@ function F.stopSendingNow(reasonText)
 		S[k] = nil
 	end
 	S.isSending = false
+	S.activeBatchRemainingUnits, S.liveMultiBoxList, S.lastWrittenMultiText = nil, nil, nil
 	F.setSendingVisual(false)
 	if not S.isDestroyed then
 		F.syncLiveInventoryUI(true)
@@ -1855,16 +1895,19 @@ function F.startSending()
 	local adaptiveDelay = userMinDelay
 	if activeMode == "multi" then
 		S.lastUnsentRecipients, S.currentBatchRecipients, S.currentBatchCompletedSet = {}, recipients, {}
+		S.liveMultiBoxList, S.lastWrittenMultiText = recipients, UI.MultiRecipBox.Text
 		UI.FilterUnsentBtn.Visible = false
 		F.updateMultiCounters(#recipients, #recipients, 0, 0)
 	end
+	S.activeBatchRemainingUnits = #recipients * qtyPerUser
 	F.setProgress(0)
 	S.isSending, S.cancelRequested = true, false
 	F.setSendingVisual(true)
+	F.updateSelectedPreview()
 
 	S.sendThread = task.spawn(function()
 		local totalRecipients, totalSent, totalMails, totalFailed, usersCompleted = #recipients, 0, 0, 0, 0
-		local failedUserNotes, stopReason, maxRemainingByUid = {}, nil, {}
+		local failedUserNotes, stopReason, maxRemainingByUid, completedLowerSet = {}, nil, {}, {}
 		local batchStartClock, lastSuccessClock, cleanStreak, cachedSendCost = os.clock(), 0, 0, F.getMailboxSendCost()
 		local waveUsed = 0
 
@@ -1994,6 +2037,12 @@ function F.startSending()
 							maxRemainingByUid[cand.uid] = math.max(0, cand.cappedAm - sendAmt)
 							taskItem.remaining = math.max(0, taskItem.remaining - sendAmt)
 							totalSent, totalMails = totalSent + sendAmt, totalMails + 1
+							F.recomputeRemainingUnits(waveQueue)
+							if taskItem.remaining <= 0 and activeMode == "multi" then
+								S.currentBatchCompletedSet[recipient] = true
+								completedLowerSet[string.lower(recipient)] = true
+								F.removeCompletedFromMultiBox(completedLowerSet)
+							end
 							F.syncLiveInventoryUI(true)
 						elseif retryFreshStack then
 							if not F.waitInterruptible(0.15, nil) then stopReason = "Stopped." break end
@@ -2008,12 +2057,20 @@ function F.startSending()
 							failedMap[recipient] = nil
 							totalFailed = math.max(0, totalFailed - 1)
 						end
-						if activeMode == "multi" then S.currentBatchCompletedSet[recipient] = true; F.recordSentLog(recipient) end
+						if activeMode == "multi" then
+							S.currentBatchCompletedSet[recipient] = true
+							completedLowerSet[string.lower(recipient)] = true
+							F.recordSentLog(recipient)
+						end
 					elseif not S.cancelRequested and not S.isDestroyed then
 						taskItem.reason = tostring(recipientFailReason or "incomplete")
 						taskItem.perm = recipientPerm
 						if failedMap[recipient] == nil then totalFailed = totalFailed + 1 end
 						failedMap[recipient] = taskItem.reason
+						if recipientPerm then
+							F.recomputeRemainingUnits(waveQueue)
+							F.updateSelectedPreview()
+						end
 					end
 
 					local remWave = math.max(0, waveTotal - rIdx)
@@ -2049,6 +2106,7 @@ function F.startSending()
 		end)
 
 		S.isSending, S.sendThread, S.activeInvokeThread, S.activeTimeoutThread = false, nil, nil, nil
+		S.activeBatchRemainingUnits, S.liveMultiBoxList, S.lastWrittenMultiText = nil, nil, nil
 		if S.isDestroyed then return end
 		F.setSendingVisual(false)
 		F.syncLiveInventoryUI(true)
@@ -2176,6 +2234,7 @@ do
 	F.trackConn(UI.SingleUserBox:GetPropertyChangedSignal("Text"):Connect(function() pcall(function() sanitizeSingleBox(false); F.updateRecipientBadges(); F.updateSelectedPreview() end) end))
 	F.trackConn(UI.SingleUserBox.FocusLost:Connect(function() pcall(function() sanitizeSingleBox(true); F.updateRecipientBadges(); F.updateSelectedPreview() end) end))
 	F.trackConn(UI.MultiRecipBox:GetPropertyChangedSignal("Text"):Connect(function()
+		if S.updatingMultiBox then return end
 		pcall(function()
 			F.updateRecipientBadges(); F.updateSelectedPreview()
 			if not S.isSending and not S.isScanning then F.setStatus("Ready.", Color3.fromRGB(165, 205, 180)) end
